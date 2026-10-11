@@ -40,6 +40,21 @@ Create these nine headers in row 1. The app finds columns by exact header name, 
 
 The Apps Script integration has not been connected to a real sheet in this workspace. Verify it against a copy of the event sheet before relying on it at the event.
 
+## Individual QR email test (off by default)
+
+The optional coordinator-only `/qr-email-test` screen sends an individual message containing an inline QR image generated from that row's existing `QR Token`. The browser never receives email addresses or QR tokens. The test is limited in both Flask and Apps Script to the first three eligible rows in sheet order (nonempty Registration ID and Name, valid email, and existing valid unique QR token). It does not generate tokens or change attendance.
+
+Before enabling the feature, append these exact headers to the Sheet header row:
+
+| QR Email Status | QR Email Timestamp | QR Email Error |
+|---|---|---|
+
+These are separate from the existing nine attendance/QR columns. The email tool only writes these three tracking cells. Status values are `Sending`, `Sent`, or `Failed`; safe error codes are `quota_exhausted` and `delivery_failed`. Any prior attempt blocks another send, including a failed or interrupted attempt, to prevent accidental duplicates. A stuck `Sending` status requires manual verification before anyone considers clearing it.
+
+Email is delivered by Google Apps Script `MailApp`, as the account that owns/runs the script; no SMTP password or provider credential is added to Flask. Update and deploy the Apps Script code, then authorize its requested mail scope (`script.send_mail`) while signed into the owner account. Google enforces per-user daily recipient quotas; the published baseline is 100 recipients/day for consumer accounts and 1,500/day for Google Workspace accounts, with quotas subject to change. Check the current [MailApp documentation](https://developers.google.com/apps-script/reference/mail/mail-app) and [Apps Script quotas](https://developers.google.com/apps-script/guides/services/quotas). Each message here has one recipient.
+
+To run the controlled test, first populate only the first three eligible rows with addresses you control or dummy test inboxes, deploy the updated Apps Script, and verify the three tracking headers. Then set `QR_EMAIL_TEST_MODE=true` in the local environment or Render service settings. Leave it `false` otherwise. Sign in as coordinator, open **QR email test**, verify each displayed identity, and confirm each individual send. This sends real email when enabled; the automated tests use a fake Sheets client and never send email. Do not enable this on production attendee rows for the initial test.
+
 ## Local setup and run
 
 Python 3.10+ is recommended.

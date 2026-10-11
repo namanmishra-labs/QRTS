@@ -41,6 +41,41 @@ class FakeSheets:
     def list_attendees(self):
         return {"attendees": []}
 
+    def _qr_email_rows(self):
+        if not hasattr(self, "email_rows"):
+            self.email_rows = [
+                {"row_number": 2, "registration_id": "TEST-1", "name": "Test Attendee 1",
+                 "email": "attendee1@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000001",
+                 "email_status": "", "email_timestamp": "", "email_error": ""},
+                {"row_number": 3, "registration_id": "TEST-2", "name": "Test Attendee 2",
+                 "email": "attendee2@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000002",
+                 "email_status": "", "email_timestamp": "", "email_error": ""},
+                {"row_number": 4, "registration_id": "TEST-3", "name": "Test Attendee 3",
+                 "email": "attendee3@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000003",
+                 "email_status": "", "email_timestamp": "", "email_error": ""},
+                {"row_number": 5, "registration_id": "TEST-4", "name": "Outside Test Cohort",
+                 "email": "outside@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000004",
+                 "email_status": "", "email_timestamp": "", "email_error": ""},
+            ]
+        return self.email_rows
+
+    def qr_email_candidates(self):
+        return {"candidates": [dict(row) for row in self._qr_email_rows()]}
+
+    def send_qr_email(self, row_number, qr_token, qr_png_base64):
+        row = next((item for item in self._qr_email_rows()
+                    if item["row_number"] == row_number), None)
+        if row is None:
+            return {"error": True, "code": "email_not_eligible"}
+        if row["email_status"]:
+            return {"error": True, "code": "email_already_attempted"}
+        self.email_sends = getattr(self, "email_sends", [])
+        self.email_sends.append({"row_number": row_number, "qr_token": qr_token,
+                                 "qr_png_base64": qr_png_base64})
+        row["email_status"] = "Sent"
+        row["email_timestamp"] = "test timestamp"
+        return {"sent": True, "email_status": "Sent", "email_timestamp": row["email_timestamp"]}
+
 
 class AttendanceAppTests(unittest.TestCase):
     token = "QRTS1:0123456789abcdef0123456789abcdef"
@@ -52,6 +87,7 @@ class AttendanceAppTests(unittest.TestCase):
             "COORDINATOR_PASSWORD": "coordinator-pass",
             "SESSION_COOKIE_SECURE": False,
         }, self.sheets)
+        self.app.config["QR_EMAIL_TEST_MODE"] = True
         self.client = self.app.test_client()
         self.csrf = ""
 
@@ -268,6 +304,102 @@ class AttendanceAppTests(unittest.TestCase):
         }, self.sheets)
         response = app.test_client().get("/")
         self.assertEqual(response.status_code, 503)
+
+    def test_setup_page_regression_for_short_nonempty_environment_values(self):
+        app = create_app({
+            "TESTING": True,
+            "SECRET_KEY": "s" * 31,
+            "COORDINATOR_PASSWORD": "p" * 16,
+        }, self.sheets)
+        response = app.test_client().get("/")
+        self.assertEqual(response.status_code, 503)
+
+    def test_config_health_reports_only_boolean_presence_and_readiness(self):
+        app = create_app({
+            "TESTING": True, "SECRET_KEY": "", "COORDINATOR_PASSWORD": "",
+        }, self.sheets)
+        response = app.test_client().get("/health/config")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {
+            "flask_secret_key_present": False,
+            "coordinator_password_present": False,
+            "setup_ready": False,
+        })
+        self.assertTrue(all(isinstance(value, bool) for value in response.json.values()))
+
+    def test_whitespace_only_credentials_do_not_count_as_configured(self):
+        app = create_app({
+            "TESTING": True, "SECRET_KEY": " " * 40, "COORDINATOR_PASSWORD": " " * 20,
+        }, self.sheets)
+        response = app.test_client().get("/health/config")
+        self.assertEqual(response.json["flask_secret_key_present"], False)
+        self.assertEqual(response.json["coordinator_password_present"], False)
+        self.assertEqual(response.json["setup_ready"], False)
+
+
+    def test_qr_email_candidates_are_admin_only_capped_and_hide_recipients_and_tokens(self):
+        response = self.client.post("/api/qr-email/candidates")
+        self.assertEqual(response.status_code, 401)
+        self.login()
+        response = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["row_number"] for item in response.json["candidates"]], [2, 3, 4])
+        self.assertNotIn("email", response.json["candidates"][0])
+        self.assertNotIn("qr_token", response.json["candidates"][0])
+
+    def test_qr_email_test_mode_must_be_enabled(self):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_MODE"] = False
+        response = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json["code"], "email_test_disabled")
+
+    def test_qr_email_send_requires_confirmation_and_rejects_rows_after_first_three(self):
+        self.login()
+        response = self.post_json("/api/qr-email/send", {"row_number": 2})
+        self.assertEqual(response.status_code, 400)
+        response = self.post_json("/api/qr-email/send", {
+            "row_number": 5, "confirm_send": True,
+        })
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(getattr(self.sheets, "email_sends", []), [])
+
+    @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
+    def test_qr_email_delivery_uses_existing_token_and_duplicate_is_blocked(self, make_qr):
+        self.login()
+        first = self.post_json("/api/qr-email/send", {
+            "row_number": 2, "confirm_send": True,
+        })
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json["email_status"], "Sent")
+        self.assertEqual(len(self.sheets.email_sends), 1)
+        sent = self.sheets.email_sends[0]
+        self.assertEqual(sent["qr_token"], self.sheets.email_rows[0]["qr_token"])
+        self.assertEqual(sent["qr_png_base64"], "iVBOR-test-generated-image")
+        make_qr.assert_called_once_with(self.sheets.email_rows[0]["qr_token"])
+        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
+        self.assertNotIn("email", first.json)
+        self.assertNotIn("qr_token", first.json)
+
+        second = self.post_json("/api/qr-email/send", {
+            "row_number": 2, "confirm_send": True,
+        })
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(len(self.sheets.email_sends), 1)
+
+    @patch("app.requests.post")
+    def test_apps_script_qr_email_client_uses_mocked_http_actions(self, mocked_post):
+        response = Mock()
+        response.json.return_value = {"candidates": []}
+        mocked_post.return_value = response
+        client = AppsScriptSheets("https://unit-test.invalid/exec", "test-only-secret")
+        self.assertEqual(client.qr_email_candidates(), {"candidates": []})
+        self.assertEqual(mocked_post.call_args.kwargs["json"]["action"], "qr_email_candidates")
+
+        response.json.return_value = {"sent": True, "email_status": "Sent"}
+        result = client.send_qr_email(2, self.token, "test-image-data")
+        self.assertTrue(result["sent"])
+        self.assertEqual(mocked_post.call_args.kwargs["json"]["action"], "send_qr_email")
 
 
 if __name__ == "__main__":
