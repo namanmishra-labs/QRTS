@@ -268,7 +268,7 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         for checkpoint in ("day1_morning", "day1_evening", "day2_morning", "day2_evening"):
             self.assertIn(checkpoint.encode(), response.data)
-        self.assertIn(b"Day 1 \xe2\x80\x93 Morning", response.data)
+        self.assertIn(b"value=\"day1_morning\"><span>Day 1<br><strong>Morning", response.data)
 
     def test_checkin_card_hides_status_history_and_requires_one_selection(self):
         self.login()
@@ -277,9 +277,12 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertNotIn(b"Selected checkpoint status", response.data)
         self.assertIn(b'id="attendee-name"', response.data)
         self.assertIn(b'id="attendee-id"', response.data)
-        self.assertIn(b'<option value="" selected>Select one checkpoint</option>', response.data)
-        self.assertIn(b'<option value="" selected>Select a status</option>', response.data)
-        self.assertEqual(response.data.count(b'<option value="day'), 4)
+        self.assertIn(b'id="attendance-modal"', response.data)
+        self.assertIn(b'id="mark-present" type="checkbox"', response.data)
+        self.assertIn(b'Mark attendance as Present', response.data)
+        self.assertIn(b'Submit Attendance', response.data)
+        self.assertEqual(response.data.count(b'type="radio" name="checkpoint"'), 4)
+        self.assertNotIn(b'<select', response.data)
 
     @patch("app.requests.post")
     def test_apps_script_client_reports_invalid_response(self, post):

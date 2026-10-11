@@ -8,6 +8,7 @@ class FakeElement {
     this.classNames = new Set();
     this.disabled = false;
     this.hidden = false;
+    this.checked = false;
     this.video = null;
     this.textContent = '';
     this.className = '';
@@ -15,24 +16,28 @@ class FakeElement {
   addEventListener(name, callback) { this.listeners[name] = callback; }
   querySelector(selector) { return selector === 'video' ? this.video : null; }
   scrollIntoView() {}
+  focus() {}
   get classList() {
     return {
       add: (name) => this.classNames.add(name),
       remove: (name) => this.classNames.delete(name),
+      toggle: (name, force) => force ? this.classNames.add(name) : this.classNames.delete(name),
     };
   }
 }
 
 async function runScenario({failures = [], cameras = [], makeVideo = true, fetchImpl, confirm = () => true} = {}) {
   const ids = [
-    'start-scan', 'stop-scan', 'switch-camera', 'notice', 'attendee-card', 'checkpoint',
-    'reader', 'camera-help', 'confirm-update', 'checkpoint-section', 'logout',
-    'new-status', 'attendee-name', 'attendee-id',
+    'start-scan', 'stop-scan', 'switch-camera', 'notice', 'main', 'attendance-modal', 'checkpoint-section',
+    'reader', 'camera-help', 'confirm-update', 'logout', 'mark-present', 'modal-feedback', 'cancel-scan',
+    'attendee-name', 'attendee-id',
   ];
   const elements = Object.fromEntries(ids.map((id) => [`#${id}`, new FakeElement()]));
-  elements['#checkpoint'].value = '';
-  elements['#checkpoint'].disabled = true;
-  elements['#new-status'].value = '';
+  elements['#attendance-modal'].hidden = true;
+  const checkpoints = ['day1_morning', 'day1_evening', 'day2_morning', 'day2_evening'].map((value) => {
+    const item = new FakeElement(); item.value = value; return item;
+  });
+  checkpoints[0].checked = true;
   const reader = elements['#reader'];
   const calls = [];
   const instances = [];
@@ -69,8 +74,9 @@ async function runScenario({failures = [], cameras = [], makeVideo = true, fetch
   const context = {
     document: {
       querySelector: (selector) => selector === 'meta[name="csrf-token"]'
-        ? {content: 'test-csrf'} : elements[selector],
-      querySelectorAll: () => [],
+        ? {content: 'test-csrf'} : (selector === 'main' ? elements['#main'] : elements[selector]),
+      querySelectorAll: (selector) => selector === 'input[name="checkpoint"]' ? checkpoints : [],
+      addEventListener() {},
     },
     window: {
       Html5Qrcode: MockScanner,
@@ -90,7 +96,7 @@ async function runScenario({failures = [], cameras = [], makeVideo = true, fetch
     JSON,
   };
   vm.runInNewContext(fs.readFileSync('static/app.js', 'utf8'), context);
-  return {elements, calls, instances};
+  return {elements, calls, instances, checkpoints};
 }
 
 function startCall(calls, index = 0) {
@@ -138,26 +144,57 @@ function startCall(calls, index = 0) {
   await appFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   assert.equal(appFlow.elements['#attendee-name'].textContent, 'Test Attendee');
   assert.equal(appFlow.elements['#attendee-id'].textContent, 'REG-TEST');
-  assert.equal(appFlow.elements['#attendee-card'].hidden, false);
-  assert.equal(appFlow.elements['#checkpoint-section'].hidden, false);
-  appFlow.elements['#checkpoint'].value = 'day2_evening';
-  appFlow.elements['#checkpoint'].listeners.change();
-  appFlow.elements['#new-status'].value = 'Registered';
-  appFlow.elements['#new-status'].listeners.change({currentTarget: appFlow.elements['#new-status']});
+  assert.equal(appFlow.elements['#attendance-modal'].hidden, false, 'valid attendee opens modal');
+  assert.equal(appFlow.elements['#mark-present'].checked, false, 'checkbox defaults unchecked');
+  appFlow.checkpoints.forEach((option) => { option.checked = option.value === 'day2_evening'; });
+  appFlow.checkpoints[3].listeners.change();
   const submit = appFlow.elements['#confirm-update'].listeners.click;
   const firstSubmit = submit({currentTarget: appFlow.elements['#confirm-update']});
   const secondSubmit = submit({currentTarget: appFlow.elements['#confirm-update']});
   assert.equal(sent.length, 2, 'only lookup plus one attendance request despite duplicate clicks');
-  assert.deepEqual(sent[1], {
-    token: 'QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', checkpoint: 'day2_evening',
-    status: 'Registered', expected_status: 'Present',
-  });
+  assert.equal(sent[1].checkpoint, 'day2_evening');
+  assert.equal(sent[1].status, 'Registered', 'unchecked checkbox maps to Registered');
+  assert.equal(sent[1].expected_status, 'Present');
+  assert.equal(Object.keys(sent[1]).filter((key) => key === 'checkpoint').length, 1);
   resolveUpdate({ok: true, json: async () => ({status: 'Registered', duplicate: false})});
   await Promise.all([firstSubmit, secondSubmit]);
-  assert.equal(appFlow.elements['#attendee-card'].hidden, true, 'successful update clears attendee');
-  assert.equal(appFlow.elements['#checkpoint'].value, '', 'successful update clears checkpoint');
-  assert.equal(appFlow.elements['#new-status'].value, '', 'successful update clears status');
+  assert.equal(appFlow.elements['#attendance-modal'].hidden, true, 'success closes modal');
+  assert.equal(appFlow.elements['#mark-present'].checked, false, 'success resets checkbox');
+  assert.equal(appFlow.elements['#start-scan'].textContent, 'Scan Next Attendee');
+  assert.equal(appFlow.elements['#attendee-name'].textContent, '', 'success clears attendee identity');
   assert.match(appFlow.elements['#notice'].textContent, /updated successfully/i);
+  await appFlow.elements['#start-scan'].listeners.click();
+  assert.equal(appFlow.instances.length, 2, 'next attendee scan can start immediately');
+
+  let presentRequest;
+  const presentFlow = await runScenario({fetchImpl: async (path, options) => {
+    if (path === '/api/lookup') return {ok: true, json: async () => ({attendee})};
+    presentRequest = JSON.parse(options.body);
+    return {ok: true, json: async () => ({status: 'Present', duplicate: false})};
+  }});
+  await presentFlow.elements['#start-scan'].listeners.click();
+  await presentFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  presentFlow.elements['#mark-present'].checked = true;
+  await presentFlow.elements['#confirm-update'].listeners.click();
+  assert.equal(presentRequest.status, 'Present', 'checked checkbox maps to Present');
+  assert.equal(presentFlow.elements['#attendance-modal'].hidden, true, 'checked checkbox submits Present');
+
+  const invalidFlow = await runScenario({fetchImpl: async () => ({
+    ok: false, json: async () => ({error: 'QR code was not found.', code: 'unknown_qr'}),
+  })});
+  await invalidFlow.elements['#start-scan'].listeners.click();
+  await invalidFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(invalidFlow.elements['#attendance-modal'].hidden, true, 'invalid QR does not open attendance modal');
+  assert.match(invalidFlow.elements['#notice'].textContent, /QR code was not found/);
+
+  const cancelFlow = await runScenario({fetchImpl: async () => ({ok: true, json: async () => ({attendee})})});
+  await cancelFlow.elements['#start-scan'].listeners.click();
+  await cancelFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  cancelFlow.elements['#mark-present'].checked = true;
+  await cancelFlow.elements['#cancel-scan'].listeners.click();
+  assert.equal(cancelFlow.elements['#attendance-modal'].hidden, true, 'cancel closes modal');
+  assert.equal(cancelFlow.elements['#mark-present'].checked, false, 'cancel resets checkbox');
+  assert.equal(cancelFlow.instances.length, 2, 'cancel resumes scanner without page reload');
 
   const failedFlow = await runScenario({fetchImpl: async (path) => {
     if (path === '/api/lookup') return {ok: true, json: async () => ({attendee})};
@@ -165,14 +202,14 @@ function startCall(calls, index = 0) {
   }});
   await failedFlow.elements['#start-scan'].listeners.click();
   await failedFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  failedFlow.elements['#checkpoint'].value = 'day1_evening';
-  failedFlow.elements['#checkpoint'].listeners.change();
-  failedFlow.elements['#new-status'].value = 'Present';
-  failedFlow.elements['#new-status'].listeners.change({currentTarget: failedFlow.elements['#new-status']});
-  await failedFlow.elements['#confirm-update'].listeners.click({currentTarget: failedFlow.elements['#confirm-update']});
-  assert.equal(failedFlow.elements['#attendee-card'].hidden, false, 'failed request keeps attendee available for retry');
-  assert.match(failedFlow.elements['#notice'].textContent, /Update failed safely/);
-  assert.equal(failedFlow.elements['#notice'].className, 'notice error');
+  failedFlow.checkpoints.forEach((option) => { option.checked = option.value === 'day1_evening'; });
+  failedFlow.checkpoints[1].listeners.change();
+  failedFlow.elements['#mark-present'].checked = true;
+  await failedFlow.elements['#confirm-update'].listeners.click();
+  assert.equal(failedFlow.elements['#attendance-modal'].hidden, false, 'failed request keeps modal available for retry');
+  assert.match(failedFlow.elements['#modal-feedback'].textContent, /Update failed safely/);
+  assert.equal(failedFlow.elements['#modal-feedback'].className, 'notice error');
+  assert.equal(failedFlow.elements['#mark-present'].checked, true, 'failed request preserves checkbox');
 
   const unavailable = await runScenario({
     failures: [Object.assign(new Error('unavailable'), {name: 'NotFoundError'})],
@@ -193,7 +230,7 @@ function startCall(calls, index = 0) {
   assert.equal(startCall(laptop.calls, 1).camera, 'available-camera', 'fallback selects an available camera');
   assert.match(laptop.elements['#notice'].textContent, /available camera is running/i);
   assert.equal(laptop.elements['#switch-camera'].textContent, 'Switch to Back Camera');
-  console.log('scanner camera switching and attendance UI checks passed');
+  console.log('scanner camera switching, QR modal and attendance checks passed');
 })().catch((error) => {
   console.error(error.message);
   process.exitCode = 1;

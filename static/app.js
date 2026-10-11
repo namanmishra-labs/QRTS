@@ -4,16 +4,14 @@
   const stop = document.querySelector('#stop-scan');
   const switchCamera = document.querySelector('#switch-camera');
   const reader = document.querySelector('#reader');
+  const mainContent = document.querySelector('main');
   const notice = document.querySelector('#notice');
-  const card = document.querySelector('#attendee-card');
+  const modal = document.querySelector('#attendance-modal');
   const checkpointSection = document.querySelector('#checkpoint-section');
-  const checkpoint = document.querySelector('#checkpoint');
-  const checkpointLabels = {
-    day1_morning: 'Day 1 – Morning',
-    day1_evening: 'Day 1 – Evening',
-    day2_morning: 'Day 2 – Morning',
-    day2_evening: 'Day 2 – Evening'
-  };
+  const checkpointOptions = Array.from(document.querySelectorAll('input[name="checkpoint"]'));
+  const presentCheckbox = document.querySelector('#mark-present');
+  const modalFeedback = document.querySelector('#modal-feedback');
+  const submitAttendance = document.querySelector('#confirm-update');
   let scanner = null;
   let active = false;
   let cameraBusy = false;
@@ -26,6 +24,10 @@
     notice.className = `notice ${kind}`;
     notice.hidden = false;
   };
+  const selectedCheckpoint = () => {
+    const selected = checkpointOptions.find((option) => option.checked);
+    return selected ? selected.value : '';
+  };
   async function api(path, data) {
     const response = await fetch(path, {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
@@ -36,7 +38,7 @@
     return result;
   }
   function updateCameraControls() {
-    start.disabled = cameraBusy || active;
+    start.disabled = cameraBusy || active || !selectedCheckpoint();
     stop.disabled = cameraBusy || !active;
     switchCamera.disabled = cameraBusy;
     switchCamera.textContent = activeFacing === 'user'
@@ -89,7 +91,6 @@
     }
     cameraBusy = true;
     updateCameraControls();
-    card.hidden = true;
     reader.classList.add('scanner-active');
     message(facing === activeFacing && active ? 'Restarting camera…' : 'Starting camera…', '');
     let fallbackCamera = null;
@@ -151,14 +152,15 @@
   }
   function resetAttendanceForm() {
     current = null;
-    card.hidden = true;
-    checkpointSection.hidden = true;
-    checkpoint.disabled = true;
-    checkpoint.value = '';
-    const status = document.querySelector('#new-status');
-    status.value = '';
-    status.disabled = true;
-    document.querySelector('#confirm-update').disabled = true;
+    modal.hidden = true;
+    mainContent.inert = false;
+    presentCheckbox.checked = false;
+    document.querySelector('#attendee-name').textContent = '';
+    document.querySelector('#attendee-id').textContent = '';
+    modalFeedback.hidden = true;
+    modalFeedback.textContent = '';
+    submitAttendance.disabled = false;
+    submitAttendance.textContent = 'Submit Attendance';
   }
   async function handleScan(decoded) {
     if (!active || cameraBusy) return;
@@ -172,15 +174,13 @@
       current = {token: decoded, attendee: result.attendee};
       document.querySelector('#attendee-name').textContent = result.attendee.name;
       document.querySelector('#attendee-id').textContent = result.attendee.registration_id;
-      checkpoint.value = '';
-      checkpoint.disabled = false;
-      checkpointSection.hidden = false;
-      document.querySelector('#new-status').value = '';
-      document.querySelector('#new-status').disabled = false;
-      document.querySelector('#confirm-update').disabled = true;
-      card.hidden = false;
-      card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-      message('Attendee verified. Select one checkpoint and status, then confirm.', '');
+      presentCheckbox.checked = false;
+      modalFeedback.hidden = true;
+      modalFeedback.textContent = '';
+      mainContent.inert = true;
+      modal.hidden = false;
+      submitAttendance.focus();
+      message('Attendee verified. Review the details and submit attendance.', '');
     } catch (error) {
       resetAttendanceForm();
       const cameraError = error.code === 'unknown_qr' || error.code === 'invalid_qr';
@@ -188,10 +188,19 @@
     }
   }
   start.addEventListener('click', async () => {
+    if (!selectedCheckpoint()) {
+      message('Select one checkpoint before starting the scanner.', 'warning');
+      return;
+    }
     notice.hidden = true;
+    start.textContent = 'Start Scanner';
     await startCamera(activeFacing);
   });
   switchCamera.addEventListener('click', async () => {
+    if (!selectedCheckpoint()) {
+      message('Select one checkpoint before starting the scanner.', 'warning');
+      return;
+    }
     const requestedFacing = activeFacing === 'user' ? 'environment' : 'user';
     await startCamera(requestedFacing);
   });
@@ -204,34 +213,43 @@
     updateCameraControls();
     message('Scanner stopped. Start it again when ready.');
   });
-  checkpoint.addEventListener('change', () => {
-    const status = document.querySelector('#new-status');
-    status.value = '';
-    document.querySelector('#confirm-update').disabled = !current || !checkpoint.value || !status.value;
+  checkpointOptions.forEach((option) => option.addEventListener('change', () => {
+    updateCameraControls();
+    checkpointSection.classList.toggle('checkpoint-selected', Boolean(selectedCheckpoint()));
+  }));
+  document.querySelector('#cancel-scan').addEventListener('click', async () => {
+    if (updateInProgress) return;
+    resetAttendanceForm();
+    await startCamera(activeFacing);
   });
-  document.querySelector('#new-status').addEventListener('change', (event) => {
-    document.querySelector('#confirm-update').disabled = !current || !checkpoint.value || !event.currentTarget.value;
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !modal.hidden && !updateInProgress) {
+      document.querySelector('#cancel-scan').click();
+    }
   });
-  document.querySelector('#confirm-update').addEventListener('click', async (event) => {
-    if (!current || updateInProgress || !checkpoint.value) return;
-    const button = event.currentTarget;
-    const oldStatus = current.attendee[checkpoint.value];
-    const newStatus = document.querySelector('#new-status').value;
-    if (!newStatus) { message('Select Present or Registered before confirming.', 'warning'); return; }
-    const selectedCheckpoint = checkpoint.value;
+  submitAttendance.addEventListener('click', async () => {
+    if (!current || updateInProgress || !selectedCheckpoint()) return;
+    const button = submitAttendance;
+    const checkpointKey = selectedCheckpoint();
+    const oldStatus = current.attendee[checkpointKey];
+    const newStatus = presentCheckbox.checked ? 'Present' : 'Registered';
     const selectedAttendee = current;
-    if (!window.confirm(`Save ${newStatus} for ${checkpointLabels[selectedCheckpoint]} for ${selectedAttendee.attendee.name}?`)) return;
     updateInProgress = true;
     button.disabled = true;
+    button.textContent = 'Submitting…';
     try {
       const result = await api('/api/attendance', {
-        token: selectedAttendee.token, checkpoint: selectedCheckpoint, status: newStatus, expected_status: oldStatus
+        token: selectedAttendee.token, checkpoint: checkpointKey, status: newStatus, expected_status: oldStatus
       });
       resetAttendanceForm();
+      start.textContent = 'Scan Next Attendee';
       message(result.duplicate ? 'This status was already recorded. Scan the next attendee when ready.' : 'Attendance updated successfully. Scan the next attendee when ready.', '');
     } catch (error) {
-      message(error.message, error.code === 'conflict' ? 'warning' : 'error');
+      modalFeedback.textContent = error.message;
+      modalFeedback.className = `notice ${error.code === 'conflict' ? 'warning' : 'error'}`;
+      modalFeedback.hidden = false;
       button.disabled = false;
+      button.textContent = 'Submit Attendance';
     } finally { updateInProgress = false; }
   });
   document.querySelector('#logout').addEventListener('click', async () => {
@@ -239,5 +257,6 @@
     window.location.assign('/');
   });
   window.addEventListener('pagehide', () => { if (scanner && active) scanner.stop().catch(() => {}); });
+  checkpointSection.classList.toggle('checkpoint-selected', Boolean(selectedCheckpoint()));
   updateCameraControls();
 })();
