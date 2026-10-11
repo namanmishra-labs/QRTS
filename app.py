@@ -366,13 +366,6 @@ def create_app(test_config=None, sheets_client=None):
         if (not isinstance(status, str) or status not in ALLOWED_STATUSES or
                 not isinstance(expected_status, str) or expected_status not in ALLOWED_STATUSES):
             return jsonify(error="Choose a valid attendance status.", code="invalid_status"), 400
-        if status == expected_status:
-            return jsonify(error="The attendee already has this status.", code="duplicate",
-                           status=status), 200
-        if expected_status != "Registered" and body.get("confirm_status_change") is not True:
-            return jsonify(error="Confirm the change to the existing attendance status.",
-                           code="status_change_confirmation_required",
-                           current_status=expected_status), 428
         try:
             # This protects concurrent requests handled by a single app worker.
             # Apps Script also uses LockService and checks expected_status atomically.
@@ -385,7 +378,10 @@ def create_app(test_config=None, sheets_client=None):
         if result.get("conflict"):
             return jsonify(error="Attendance changed since it was loaded. Scan again.",
                            code="conflict", current_status=result.get("current_status")), 409
-        return jsonify(message="Attendance updated.", status=status, duplicate=False)
+        duplicate = bool(result.get("duplicate"))
+        return jsonify(message="Attendance already has this status." if duplicate else "Attendance updated.",
+                       status=result.get("status", status), duplicate=duplicate,
+                       code="duplicate" if duplicate else "updated")
 
     @app.post("/api/attendees/qr")
     def attendee_qr_list():

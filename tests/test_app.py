@@ -139,14 +139,9 @@ class AttendanceAppTests(unittest.TestCase):
                 "expected_status": "Present",
             })
             self.assertEqual(repeated.json["code"], "duplicate")
-            unconfirmed = self.post_json("/api/attendance", {
-                "token": self.token, "checkpoint": checkpoint, "status": "Registered",
-                "expected_status": "Present",
-            })
-            self.assertEqual(unconfirmed.status_code, 428)
             registered = self.post_json("/api/attendance", {
                 "token": self.token, "checkpoint": checkpoint, "status": "Registered",
-                "expected_status": "Present", "confirm_status_change": True,
+                "expected_status": "Present",
             })
             self.assertEqual(registered.status_code, 200)
             self.assertEqual(self.sheets.attendees[self.token][checkpoint], "Registered")
@@ -172,7 +167,7 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(self.sheets.attendees[self.token]["day2_morning"], "Registered")
         self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
 
-    def test_existing_attendance_requires_change_confirmation_and_warns_on_duplicate(self):
+    def test_existing_attendance_can_be_corrected_without_old_status_confirmation(self):
         self.login()
         self.sheets.attendees[self.token]["day1_morning"] = "Present"
         lookup = self.post_json("/api/lookup", {"token": self.token})
@@ -184,18 +179,11 @@ class AttendanceAppTests(unittest.TestCase):
         })
         self.assertEqual(duplicate.json["code"], "duplicate")
         self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Present")
-        unconfirmed = self.post_json("/api/attendance", {
+        corrected = self.post_json("/api/attendance", {
             "token": self.token, "checkpoint": "day1_morning", "status": "Registered",
             "expected_status": "Present",
         })
-        self.assertEqual(unconfirmed.status_code, 428)
-        self.assertEqual(unconfirmed.json["code"], "status_change_confirmation_required")
-        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Present")
-        confirmed = self.post_json("/api/attendance", {
-            "token": self.token, "checkpoint": "day1_morning", "status": "Registered",
-            "expected_status": "Present", "confirm_status_change": True,
-        })
-        self.assertEqual(confirmed.status_code, 200)
+        self.assertEqual(corrected.status_code, 200)
         self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
         self.assertEqual(self.sheets.attendees[self.token]["day1_evening"], "Registered")
 
@@ -281,6 +269,17 @@ class AttendanceAppTests(unittest.TestCase):
         for checkpoint in ("day1_morning", "day1_evening", "day2_morning", "day2_evening"):
             self.assertIn(checkpoint.encode(), response.data)
         self.assertIn(b"Day 1 \xe2\x80\x93 Morning", response.data)
+
+    def test_checkin_card_hides_status_history_and_requires_one_selection(self):
+        self.login()
+        response = self.client.get("/")
+        self.assertNotIn(b"Existing status at all checkpoints", response.data)
+        self.assertNotIn(b"Selected checkpoint status", response.data)
+        self.assertIn(b'id="attendee-name"', response.data)
+        self.assertIn(b'id="attendee-id"', response.data)
+        self.assertIn(b'<option value="" selected>Select one checkpoint</option>', response.data)
+        self.assertIn(b'<option value="" selected>Select a status</option>', response.data)
+        self.assertEqual(response.data.count(b'<option value="day'), 4)
 
     @patch("app.requests.post")
     def test_apps_script_client_reports_invalid_response(self, post):

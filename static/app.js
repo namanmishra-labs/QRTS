@@ -6,8 +6,8 @@
   const reader = document.querySelector('#reader');
   const notice = document.querySelector('#notice');
   const card = document.querySelector('#attendee-card');
+  const checkpointSection = document.querySelector('#checkpoint-section');
   const checkpoint = document.querySelector('#checkpoint');
-  const attendanceWarning = document.querySelector('#existing-attendance-warning');
   const checkpointLabels = {
     day1_morning: 'Day 1 – Morning',
     day1_evening: 'Day 1 – Evening',
@@ -19,6 +19,7 @@
   let cameraBusy = false;
   let activeFacing = 'environment';
   let current = null;
+  let updateInProgress = false;
 
   const message = (text, kind = '') => {
     notice.textContent = text;
@@ -148,18 +149,16 @@
     active = true;
     updateCameraControls();
   }
-  function renderAttendanceStatus() {
-    if (!current) return;
-    const status = current.attendee[checkpoint.value];
-    document.querySelector('#current-status').textContent = status;
-    document.querySelectorAll('[data-attendance-status]').forEach((element) => {
-      element.textContent = current.attendee[element.dataset.attendanceStatus];
-    });
-    const alreadyRecorded = status !== 'Registered';
-    attendanceWarning.hidden = !alreadyRecorded;
-    attendanceWarning.textContent = alreadyRecorded
-      ? `${checkpointLabels[checkpoint.value]} की attendance पहले से दर्ज है। वर्तमान status: ${status}.`
-      : `${checkpointLabels[checkpoint.value]} के लिए अभी attendance दर्ज नहीं है।`;
+  function resetAttendanceForm() {
+    current = null;
+    card.hidden = true;
+    checkpointSection.hidden = true;
+    checkpoint.disabled = true;
+    checkpoint.value = '';
+    const status = document.querySelector('#new-status');
+    status.value = '';
+    status.disabled = true;
+    document.querySelector('#confirm-update').disabled = true;
   }
   async function handleScan(decoded) {
     if (!active || cameraBusy) return;
@@ -173,14 +172,17 @@
       current = {token: decoded, attendee: result.attendee};
       document.querySelector('#attendee-name').textContent = result.attendee.name;
       document.querySelector('#attendee-id').textContent = result.attendee.registration_id;
-      document.querySelector('#new-status').value = result.attendee[checkpoint.value];
-      renderAttendanceStatus();
+      checkpoint.value = '';
+      checkpoint.disabled = false;
+      checkpointSection.hidden = false;
+      document.querySelector('#new-status').value = '';
+      document.querySelector('#new-status').disabled = false;
+      document.querySelector('#confirm-update').disabled = true;
       card.hidden = false;
       card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-      message('Attendee verified. Review the selected checkpoint and status before confirming.', '');
+      message('Attendee verified. Select one checkpoint and status, then confirm.', '');
     } catch (error) {
-      current = null;
-      card.hidden = true;
+      resetAttendanceForm();
       const cameraError = error.code === 'unknown_qr' || error.code === 'invalid_qr';
       message(error.message, cameraError ? 'error' : 'warning');
     }
@@ -203,37 +205,34 @@
     message('Scanner stopped. Start it again when ready.');
   });
   checkpoint.addEventListener('change', () => {
-    if (current) {
-      renderAttendanceStatus();
-      document.querySelector('#new-status').value = current.attendee[checkpoint.value];
-    }
+    const status = document.querySelector('#new-status');
+    status.value = '';
+    document.querySelector('#confirm-update').disabled = !current || !checkpoint.value || !status.value;
+  });
+  document.querySelector('#new-status').addEventListener('change', (event) => {
+    document.querySelector('#confirm-update').disabled = !current || !checkpoint.value || !event.currentTarget.value;
   });
   document.querySelector('#confirm-update').addEventListener('click', async (event) => {
-    if (!current) return;
+    if (!current || updateInProgress || !checkpoint.value) return;
     const button = event.currentTarget;
     const oldStatus = current.attendee[checkpoint.value];
     const newStatus = document.querySelector('#new-status').value;
-    if (oldStatus === newStatus) { message('No change: this attendee already has that status.', 'warning'); return; }
-    const changingExistingStatus = oldStatus !== 'Registered';
-    if (changingExistingStatus && !window.confirm(
-      `${checkpointLabels[checkpoint.value]} attendance is already ${oldStatus} for ${current.attendee.name}. Change it to ${newStatus}?`
-    )) return;
+    if (!newStatus) { message('Select Present or Registered before confirming.', 'warning'); return; }
+    const selectedCheckpoint = checkpoint.value;
+    const selectedAttendee = current;
+    if (!window.confirm(`Save ${newStatus} for ${checkpointLabels[selectedCheckpoint]} for ${selectedAttendee.attendee.name}?`)) return;
+    updateInProgress = true;
     button.disabled = true;
     try {
       const result = await api('/api/attendance', {
-        token: current.token, checkpoint: checkpoint.value, status: newStatus, expected_status: oldStatus,
-        confirm_status_change: changingExistingStatus
+        token: selectedAttendee.token, checkpoint: selectedCheckpoint, status: newStatus, expected_status: oldStatus
       });
-      current.attendee[checkpoint.value] = result.status;
-      renderAttendanceStatus();
-      message(result.duplicate ? 'This attendance was already recorded.' : 'Attendance updated successfully.', '');
+      resetAttendanceForm();
+      message(result.duplicate ? 'This status was already recorded. Scan the next attendee when ready.' : 'Attendance updated successfully. Scan the next attendee when ready.', '');
     } catch (error) {
       message(error.message, error.code === 'conflict' ? 'warning' : 'error');
-      if (error.result && error.result.current_status) {
-        current.attendee[checkpoint.value] = error.result.current_status;
-        renderAttendanceStatus();
-      }
-    } finally { button.disabled = false; }
+      button.disabled = false;
+    } finally { updateInProgress = false; }
   });
   document.querySelector('#logout').addEventListener('click', async () => {
     await fetch('/logout', {method: 'POST', headers: {'X-CSRF-Token': csrf}, credentials: 'same-origin'});
