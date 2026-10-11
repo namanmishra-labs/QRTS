@@ -19,3 +19,7 @@ services:
         value: "true"
       - key: QR_EMAIL_TEST_MODE
         value: "false"
+      - key: QR_EMAIL_BULK_ENABLED
+        value: "false"
+      - key: QR_EMAIL_TEST_RECIPIENTS
+        sync: false

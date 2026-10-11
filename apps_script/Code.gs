@@ -16,7 +16,6 @@ const DEFAULTS = {
 };
 const STATUSES = ['Registered', 'Present'];
 const TOKEN_RE = /^QRTS1:[A-Za-z0-9-]{20,80}$/;
-const EMAIL_TEST_LIMIT = 3;
 const EMAIL_TRACKING_HEADERS = {
   status: 'QR Email Status',
   timestamp: 'QR Email Timestamp',
@@ -162,6 +161,11 @@ function emailTrackingColumns_(cfg) {
 function eligibleEmailRows_(cfg) {
   const items = rows_(cfg);
   const seenTokens = new Set();
+  const registrationCounts = {};
+  items.forEach(item => {
+    const id = String(item.row[cfg.cols.REGISTRATION_ID_HEADER - 1] || '').trim();
+    if (id) registrationCounts[id] = (registrationCounts[id] || 0) + 1;
+  });
   const eligible = [];
   items.forEach(item => {
     const row = item.row;
@@ -169,11 +173,13 @@ function eligibleEmailRows_(cfg) {
     const name = String(row[cfg.cols.NAME_HEADER - 1] || '').trim();
     const email = String(row[cfg.cols.EMAIL_HEADER - 1] || '').trim();
     const token = String(row[cfg.cols.QR_TOKEN_HEADER - 1] || '').trim();
-    if (!registrationId || !name || !EMAIL_RE.test(email) || !validateToken_(token) || seenTokens.has(token)) return;
+    if (!registrationId || registrationCounts[registrationId] !== 1 || !name ||
+        !validateToken_(token) || seenTokens.has(token)) return;
     seenTokens.add(token);
-    eligible.push({ row: item.row, rowNumber: item.rowNumber, registrationId, name, email, token });
+    eligible.push({ row: item.row, rowNumber: item.rowNumber, registrationId, name, email, token,
+      emailValid: EMAIL_RE.test(email) });
   });
-  return eligible.slice(0, EMAIL_TEST_LIMIT);
+  return eligible;
 }
 
 function qrEmailCandidates_() {
@@ -188,8 +194,10 @@ function qrEmailCandidates_() {
     row_number: item.rowNumber,
     registration_id: item.registrationId,
     name: item.name,
+    email: item.email,
+    email_valid: item.emailValid,
     qr_token: item.token,
-    email_status: String(cfg.sheet.getRange(item.rowNumber, tracking.status).getDisplayValue() || '').trim(),
+    email_status: String(cfg.sheet.getRange(item.rowNumber, tracking.status).getDisplayValue() || 'Pending').trim(),
     email_timestamp: String(cfg.sheet.getRange(item.rowNumber, tracking.timestamp).getDisplayValue() || '').trim(),
     email_error: String(cfg.sheet.getRange(item.rowNumber, tracking.error).getDisplayValue() || '').trim()
   }));
@@ -203,10 +211,10 @@ function escapeHtml_(value) {
 }
 
 function sendQrEmail_(body) {
-  const rowNumber = body.row_number;
+  const registrationId = typeof body.registration_id === 'string' ? body.registration_id.trim() : '';
   const token = body.token;
   const encoded = body.qr_png_base64;
-  if (!Number.isInteger(rowNumber) || rowNumber < 2 || !validateToken_(token) ||
+  if (!registrationId || registrationId.length > 80 || !validateToken_(token) ||
       typeof encoded !== 'string' || encoded.length > 30000 ||
       !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
     return json({ error: true, code: 'email_invalid_image' });
@@ -223,7 +231,7 @@ function sendQrEmail_(body) {
   }
 
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  if (!lock.tryLock(0)) return json({ error: true, code: 'email_in_progress' });
   try {
     const cfg = config_();
     let tracking;
@@ -232,13 +240,22 @@ function sendQrEmail_(body) {
     } catch (err) {
       return json({ error: true, code: 'email_tracking_not_configured' });
     }
-    const candidate = eligibleEmailRows_(cfg).find(item => item.rowNumber === rowNumber);
-    if (!candidate || candidate.token !== token) return json({ error: true, code: 'email_not_eligible' });
+    const candidate = eligibleEmailRows_(cfg).find(item => item.registrationId === registrationId);
+    if (!candidate || candidate.token !== token || !candidate.emailValid) {
+      return json({ error: true, code: candidate ? 'email_invalid_recipient' : 'email_not_eligible' });
+    }
+    const rowNumber = candidate.rowNumber;
     const statusCell = cfg.sheet.getRange(rowNumber, tracking.status);
     const timestampCell = cfg.sheet.getRange(rowNumber, tracking.timestamp);
     const errorCell = cfg.sheet.getRange(rowNumber, tracking.error);
-    const oldStatus = String(statusCell.getDisplayValue() || '').trim();
-    if (oldStatus) return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
+    let oldStatus = String(statusCell.getDisplayValue() || '').trim();
+    if (oldStatus === 'Pending') oldStatus = '';
+    const retryFailed = body.retry_failed === true;
+    if (oldStatus === 'Sent') return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
+    if (oldStatus === 'Sending') return json({ error: true, code: 'email_ambiguous_outcome', email_status: oldStatus });
+    if (oldStatus === 'Failed' && !retryFailed) return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
+    if (oldStatus && oldStatus !== 'Failed') return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
+    if (retryFailed && oldStatus !== 'Failed') return json({ error: true, code: 'email_retry_not_allowed', email_status: oldStatus });
 
     const attemptedAt = new Date();
     statusCell.setValue('Sending');
@@ -252,25 +269,39 @@ function sendQrEmail_(body) {
       SpreadsheetApp.flush();
       return json({ error: true, code: 'email_quota_exhausted', email_status: 'Failed' });
     }
+    let mailAccepted = false;
     try {
       const blob = Utilities.newBlob(imageBytes, 'image/png', 'attendee-qr.png');
       const safeName = escapeHtml_(candidate.name);
       MailApp.sendEmail({
         to: candidate.email,
         subject: 'Your QR code for Startup Conclave 2026',
-        body: 'Hello ' + candidate.name + ', your individual attendee QR code is attached inline.',
-        htmlBody: '<p>Hello ' + safeName + ',</p><p>Here is your individual attendee QR code. Please keep it available for event check-in.</p><p><img src="cid:attendeeQr" alt="Your attendee QR code"></p>',
-        inlineImages: { attendeeQr: blob }
+        body: 'Hello ' + candidate.name + ', Registration ID: ' + candidate.registrationId +
+          '. Your individual QR code is attached. Please keep it available for event check-in.',
+        htmlBody: '<p>Hello ' + safeName + ',</p><p>Registration ID: <strong>' + escapeHtml_(candidate.registrationId) +
+          '</strong></p><p>Your individual attendee QR code is below. Please keep it available for event check-in.</p><p><img src="cid:attendeeQr" alt="Your attendee QR code"></p>',
+        inlineImages: { attendeeQr: blob },
+        attachments: [blob]
       });
-      statusCell.setValue('Sent');
-      errorCell.clearContent();
-      SpreadsheetApp.flush();
-      return json({ sent: true, email_status: 'Sent', email_timestamp: attemptedAt.toISOString() });
+      mailAccepted = true;
     } catch (err) {
       statusCell.setValue('Failed');
       errorCell.setValue('delivery_failed');
       SpreadsheetApp.flush();
       return json({ error: true, code: 'email_delivery_failed', email_status: 'Failed' });
+    }
+    if (mailAccepted) {
+      try {
+        statusCell.setValue('Sent');
+        errorCell.clearContent();
+        SpreadsheetApp.flush();
+        return json({ sent: true, email_status: 'Sent', email_timestamp: attemptedAt.toISOString() });
+      } catch (err) {
+        // MailApp accepted the message, but status persistence failed. Leave Sending
+        // as a review lock so a retry cannot create an accidental duplicate.
+        try { errorCell.setValue('outcome_unknown'); SpreadsheetApp.flush(); } catch (_) {}
+        return json({ error: true, code: 'email_ambiguous_outcome', email_status: 'Sending' });
+      }
     }
   } finally {
     lock.releaseLock();

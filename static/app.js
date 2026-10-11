@@ -7,48 +7,73 @@
   const mainContent = document.querySelector('main');
   const notice = document.querySelector('#notice');
   const modal = document.querySelector('#attendance-modal');
-  const checkpointSection = document.querySelector('#checkpoint-section');
-  const checkpointOptions = Array.from(document.querySelectorAll('input[name="checkpoint"]'));
-  const presentCheckbox = document.querySelector('#mark-present');
+  const checkpointOptions = Array.from(document.querySelectorAll('input[name="attendance-checkpoint"]'));
   const modalFeedback = document.querySelector('#modal-feedback');
   const submitAttendance = document.querySelector('#confirm-update');
+  const toast = document.querySelector('#toast');
+  const checkpointLabels = {
+    day1_morning: 'Day 1 — Morning', day1_evening: 'Day 1 — Evening',
+    day2_morning: 'Day 2 — Morning', day2_evening: 'Day 2 — Evening',
+  };
   let scanner = null;
   let active = false;
   let cameraBusy = false;
   let activeFacing = 'environment';
+  let previewReady = false;
   let current = null;
   let updateInProgress = false;
+  let toastTimer = null;
+  let activeToastKey = '';
 
   const message = (text, kind = '') => {
     notice.textContent = text;
     notice.className = `notice ${kind}`;
     notice.hidden = false;
   };
-  const selectedCheckpoint = () => {
-    const selected = checkpointOptions.find((option) => option.checked);
-    return selected ? selected.value : '';
+  const showToast = (text, kind) => {
+    const key = `${kind}:${text}`;
+    if (!toast.hidden && key === activeToastKey) return;
+    if (toastTimer !== null) window.clearTimeout(toastTimer);
+    activeToastKey = key;
+    toast.textContent = text;
+    toast.className = `toast ${kind}`;
+    toast.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    toast.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
+    toast.hidden = false;
+    toastTimer = window.setTimeout(() => {
+      toast.hidden = true;
+      activeToastKey = '';
+      toastTimer = null;
+    }, 3000);
   };
+  const selectedCheckpointKeys = () => checkpointOptions
+    .filter((option) => option.checked).map((option) => option.value);
+
   async function api(path, data) {
     const response = await fetch(path, {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
       body: JSON.stringify(data), credentials: 'same-origin'
     });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(result.error || 'Request failed. Try again.'), {code: result.code, result});
+    if (!response.ok) throw Object.assign(new Error(result.error || 'Request failed. Try again.'),
+      {code: result.code, result});
     return result;
   }
+
   function updateCameraControls() {
-    start.disabled = cameraBusy || active || !selectedCheckpoint();
+    start.disabled = cameraBusy || active;
     stop.disabled = cameraBusy || !active;
-    switchCamera.disabled = cameraBusy;
-    switchCamera.textContent = activeFacing === 'user'
-      ? 'Switch to Back Camera' : 'Switch to Front Camera';
+    switchCamera.hidden = cameraBusy || !active || !previewReady;
+    switchCamera.disabled = cameraBusy || !previewReady;
+    switchCamera.textContent = 'Change Camera';
   }
+
   async function stopScanner() {
     const oldScanner = scanner;
     const wasActive = active;
     scanner = null;
     active = false;
+    previewReady = false;
     if (oldScanner) {
       if (wasActive) {
         try { await oldScanner.stop(); } catch (_) { /* continue cleanup */ }
@@ -57,6 +82,7 @@
     }
     reader.classList.remove('scanner-active');
   }
+
   async function verifyCameraPreview() {
     const video = reader.querySelector('video');
     if (!video) throw new Error('preview_missing');
@@ -72,6 +98,7 @@
     }
     return video;
   }
+
   function facingFromPreview(video, fallbackCamera, requestedFacing) {
     const track = video.srcObject.getVideoTracks()[0];
     const reported = track && track.getSettings && track.getSettings().facingMode;
@@ -81,18 +108,22 @@
     if (/rear|back|environment/i.test(label)) return 'environment';
     return requestedFacing;
   }
+
   async function startCamera(facing) {
     if (cameraBusy) return;
     if (!window.Html5Qrcode) {
-      message('The QR scanner could not load. Check your internet connection and reload.', 'error'); return;
+      message('The QR scanner could not load. Check your internet connection and reload.', 'error');
+      return;
     }
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-      message('This browser does not provide camera access. Open the site in a supported browser over HTTPS.', 'error'); return;
+      message('This browser does not provide camera access. Open the site in a supported browser over HTTPS.', 'error');
+      return;
     }
     cameraBusy = true;
+    previewReady = false;
     updateCameraControls();
     reader.classList.add('scanner-active');
-    message(facing === activeFacing && active ? 'Restarting camera…' : 'Starting camera…', '');
+    message(active ? 'Switching camera…' : 'Starting camera…');
     let fallbackCamera = null;
     let usedFallback = false;
     try {
@@ -104,7 +135,7 @@
         if (facing !== 'environment' || preferredError.name === 'NotAllowedError' ||
             preferredError.name === 'SecurityError') throw preferredError;
         let cameras = [];
-        try { cameras = await Html5Qrcode.getCameras(); } catch (_) { /* show original error below */ }
+        try { cameras = await Html5Qrcode.getCameras(); } catch (_) { /* report original error */ }
         fallbackCamera = cameras.find((camera) => camera && camera.id &&
           /front|user|integrated|built[- ]?in|facetime/i.test(camera.label || '')) ||
           cameras.find((camera) => camera && camera.id);
@@ -116,27 +147,25 @@
       }
       const video = await verifyCameraPreview();
       activeFacing = facingFromPreview(video, fallbackCamera, facing);
+      previewReady = true;
       updateCameraControls();
       message(usedFallback
-        ? 'The rear camera was unavailable. The available camera is running; use the switch button to try the front camera.'
-        : `${activeFacing === 'user' ? 'Front' : 'Back'} camera ready. Hold the attendee QR steady inside the frame.`, '');
+        ? 'Rear camera unavailable. An available camera is running.'
+        : `${activeFacing === 'user' ? 'Front' : 'Back'} camera ready.`, '');
     } catch (error) {
       await stopScanner();
       updateCameraControls();
       let explanation = 'Could not start the camera. Check browser camera permission and try again.';
-      if (error.message === 'preview_missing' || error.message === 'stream_not_live' ||
-          error.message === 'preview_not_ready') {
-        explanation = 'The camera did not provide a live video preview. Check that the camera is available, close other camera apps, then try again.';
+      if (['preview_missing', 'stream_not_live', 'preview_not_ready'].includes(error.message)) {
+        explanation = 'The camera did not provide a live preview. Check camera availability and try again.';
       } else if (error.name === 'NotAllowedError' || /permission|denied/i.test(String(error))) {
-        explanation = 'Camera permission was denied. In Android Chrome, open the site settings from the lock/tune icon, allow Camera, then reload this page.';
+        explanation = 'Camera permission was denied. Allow camera access in the browser settings, then try again.';
       } else if (error.name === 'NotFoundError' || /camera.*not found/i.test(String(error))) {
         explanation = facing === 'environment'
-          ? 'The rear camera could not start. Try Switch to Front Camera or connect/enable a camera.'
-          : 'No front camera was found. Switch back or connect/enable a camera.';
+          ? 'Rear camera unavailable. Try Start Scanner again or switch to an available camera.'
+          : 'Front camera unavailable. Try Start Scanner again.';
       } else if (error.name === 'NotReadableError' || /in use|not readable/i.test(String(error))) {
-        explanation = 'The camera may be in use by another app. Close other camera apps and try again.';
-      } else if (facing === 'environment') {
-        explanation = 'The rear camera could not start. Try Switch to Front Camera or use the available-camera fallback.';
+        explanation = 'The camera may be in use by another app. Close it and try again.';
       }
       message(explanation, 'error');
     } finally {
@@ -144,17 +173,19 @@
       updateCameraControls();
     }
   }
+
   async function launchScanner(cameraConfig) {
     scanner = new Html5Qrcode('reader', {verbose: false});
     await scanner.start(cameraConfig, {fps: 10, qrbox: {width: 250, height: 250}}, handleScan, () => {});
     active = true;
     updateCameraControls();
   }
+
   function resetAttendanceForm() {
     current = null;
     modal.hidden = true;
     mainContent.inert = false;
-    presentCheckbox.checked = false;
+    checkpointOptions.forEach((option) => { option.checked = false; });
     document.querySelector('#attendee-name').textContent = '';
     document.querySelector('#attendee-id').textContent = '';
     modalFeedback.hidden = true;
@@ -162,47 +193,44 @@
     submitAttendance.disabled = false;
     submitAttendance.textContent = 'Submit Attendance';
   }
+
   async function handleScan(decoded) {
-    if (!active || cameraBusy) return;
+    if (!active || cameraBusy || updateInProgress) return;
     cameraBusy = true;
     updateCameraControls();
     await stopScanner();
-    cameraBusy = false;
-    updateCameraControls();
+    message('Verifying QR code…');
     try {
       const result = await api('/api/lookup', {token: decoded});
       current = {token: decoded, attendee: result.attendee};
       document.querySelector('#attendee-name').textContent = result.attendee.name;
       document.querySelector('#attendee-id').textContent = result.attendee.registration_id;
-      presentCheckbox.checked = false;
+      checkpointOptions.forEach((option) => { option.checked = false; });
       modalFeedback.hidden = true;
       modalFeedback.textContent = '';
       mainContent.inert = true;
       modal.hidden = false;
-      submitAttendance.focus();
-      message('Attendee verified. Review the details and submit attendance.', '');
+      document.querySelector('#cancel-scan').focus();
     } catch (error) {
       resetAttendanceForm();
       const cameraError = error.code === 'unknown_qr' || error.code === 'invalid_qr';
-      message(error.message, cameraError ? 'error' : 'warning');
+      const errorText = cameraError ? 'QR not recognized. Start Scanner to try again.'
+        : 'QR verification failed. Please retry.';
+      message(errorText, cameraError ? 'error' : 'warning');
+      showToast(cameraError ? 'QR not recognized. Please retry.' : errorText, 'error');
+    } finally {
+      cameraBusy = false;
+      updateCameraControls();
     }
   }
+
   start.addEventListener('click', async () => {
-    if (!selectedCheckpoint()) {
-      message('Select one checkpoint before starting the scanner.', 'warning');
-      return;
-    }
     notice.hidden = true;
-    start.textContent = 'Start Scanner';
     await startCamera(activeFacing);
   });
   switchCamera.addEventListener('click', async () => {
-    if (!selectedCheckpoint()) {
-      message('Select one checkpoint before starting the scanner.', 'warning');
-      return;
-    }
-    const requestedFacing = activeFacing === 'user' ? 'environment' : 'user';
-    await startCamera(requestedFacing);
+    if (cameraBusy || !previewReady || !active) return;
+    await startCamera(activeFacing === 'user' ? 'environment' : 'user');
   });
   stop.addEventListener('click', async () => {
     if (cameraBusy) return;
@@ -211,16 +239,12 @@
     await stopScanner();
     cameraBusy = false;
     updateCameraControls();
-    message('Scanner stopped. Start it again when ready.');
+    message('Scanner stopped. Start Scanner when ready.');
   });
-  checkpointOptions.forEach((option) => option.addEventListener('change', () => {
-    updateCameraControls();
-    checkpointSection.classList.toggle('checkpoint-selected', Boolean(selectedCheckpoint()));
-  }));
-  document.querySelector('#cancel-scan').addEventListener('click', async () => {
+  document.querySelector('#cancel-scan').addEventListener('click', () => {
     if (updateInProgress) return;
     resetAttendanceForm();
-    await startCamera(activeFacing);
+    message('Attendance cancelled. Start Scanner when ready.');
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !modal.hidden && !updateInProgress) {
@@ -228,35 +252,69 @@
     }
   });
   submitAttendance.addEventListener('click', async () => {
-    if (!current || updateInProgress || !selectedCheckpoint()) return;
-    const button = submitAttendance;
-    const checkpointKey = selectedCheckpoint();
-    const oldStatus = current.attendee[checkpointKey];
-    const newStatus = presentCheckbox.checked ? 'Present' : 'Registered';
-    const selectedAttendee = current;
-    updateInProgress = true;
-    button.disabled = true;
-    button.textContent = 'Submitting…';
-    try {
-      const result = await api('/api/attendance', {
-        token: selectedAttendee.token, checkpoint: checkpointKey, status: newStatus, expected_status: oldStatus
-      });
-      resetAttendanceForm();
-      start.textContent = 'Scan Next Attendee';
-      message(result.duplicate ? 'This status was already recorded. Scan the next attendee when ready.' : 'Attendance updated successfully. Scan the next attendee when ready.', '');
-    } catch (error) {
-      modalFeedback.textContent = error.message;
-      modalFeedback.className = `notice ${error.code === 'conflict' ? 'warning' : 'error'}`;
+    if (!current || updateInProgress) return;
+    const selected = selectedCheckpointKeys();
+    if (!selected.length) {
+      modalFeedback.textContent = 'Select at least one checkpoint.';
+      modalFeedback.className = 'notice warning';
       modalFeedback.hidden = false;
-      button.disabled = false;
-      button.textContent = 'Submit Attendance';
-    } finally { updateInProgress = false; }
+      showToast('Select at least one checkpoint.', 'error');
+      return;
+    }
+    const attendee = current;
+    const checkpoints = selected.map((checkpoint) => ({
+      checkpoint, expected_status: attendee.attendee[checkpoint],
+    }));
+    updateInProgress = true;
+    submitAttendance.disabled = true;
+    submitAttendance.textContent = 'Submitting…';
+    modalFeedback.hidden = true;
+    try {
+      const result = await api('/api/attendance', {token: attendee.token, checkpoints});
+      const completed = [...(result.updated_checkpoints || []), ...(result.already_present || [])];
+      if (result.success !== true || completed.length !== selected.length) {
+        throw Object.assign(new Error('Attendance update was not confirmed. Please retry.'), {
+          result: {updated_checkpoints: result.updated_checkpoints || [],
+            already_present: result.already_present || [], code: 'incomplete_result'},
+        });
+      }
+      const count = completed.length;
+      resetAttendanceForm();
+      const successText = count === 1 ? 'Marked Present Successfully'
+        : `Attendance marked Present for ${count} checkpoints`;
+      message(successText, '');
+      showToast(successText, 'success');
+    } catch (error) {
+      const result = error.result || {};
+      if (result.code === 'conflict' && result.failed_checkpoint &&
+          ['Registered', 'Present'].includes(result.current_status)) {
+        attendee.attendee[result.failed_checkpoint] = result.current_status;
+      }
+      const completed = [...(result.updated_checkpoints || []), ...(result.already_present || [])];
+      const completedText = completed.length
+        ? `${completed.length} checkpoint(s) were already updated: ${completed.map((key) => checkpointLabels[key] || 'selected checkpoint').join(', ')}. `
+        : '';
+      const failedLabel = checkpointLabels[result.failed_checkpoint] || 'A selected checkpoint';
+      modalFeedback.textContent = result.partial
+        ? `Partial update. ${completedText}${failedLabel} could not be updated. Retry is safe; completed checkpoints will not be changed again.`
+        : `${error.message} ${completedText}${result.code === 'conflict' ? 'Review the attendance and retry.' : ''}`.trim();
+      modalFeedback.className = `notice ${result.code === 'conflict' ? 'warning' : 'error'}`;
+      modalFeedback.hidden = false;
+      const completedCount = completed.length;
+      const toastText = result.partial && completedCount
+        ? `Partial update: ${completedCount} checkpoint(s) saved. Please retry.`
+        : result.code === 'conflict' ? 'Attendance changed. Please review and retry.'
+          : 'Attendance update failed. Please retry.';
+      showToast(toastText, 'error');
+      submitAttendance.disabled = false;
+      submitAttendance.textContent = 'Submit Attendance';
+    } finally {
+      updateInProgress = false;
+    }
   });
-  document.querySelector('#logout').addEventListener('click', async () => {
-    await fetch('/logout', {method: 'POST', headers: {'X-CSRF-Token': csrf}, credentials: 'same-origin'});
-    window.location.assign('/');
+
+  window.addEventListener('pagehide', () => {
+    if (scanner && active) scanner.stop().catch(() => {});
   });
-  window.addEventListener('pagehide', () => { if (scanner && active) scanner.stop().catch(() => {}); });
-  checkpointSection.classList.toggle('checkpoint-selected', Boolean(selectedCheckpoint()));
   updateCameraControls();
 })();

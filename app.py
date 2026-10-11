@@ -21,6 +21,7 @@ ALLOWED_CHECKPOINTS = {
 }
 ALLOWED_STATUSES = {"Registered", "Present"}
 QR_EMAIL_TEST_LIMIT = 3
+QR_EMAIL_BATCH_LIMIT = 3
 QR_EMAIL_ERROR_MESSAGES = {
     "email_tracking_not_configured": "Add the three QR email tracking headers to the Sheet.",
     "email_test_disabled": "QR email test mode is disabled.",
@@ -30,6 +31,11 @@ QR_EMAIL_ERROR_MESSAGES = {
     "email_delivery_failed": "The email could not be sent. Check the safe status code in the Sheet.",
     "email_invalid_image": "The generated QR image was invalid.",
     "email_confirmation_required": "Confirm one eligible attendee email.",
+    "email_invalid_recipient": "This attendee has no valid email address.",
+    "email_invalid_selection": "Choose attendees from the current list.",
+    "email_retry_not_allowed": "Only failed email attempts can be retried.",
+    "email_ambiguous_outcome": "The send outcome needs manual review before retrying.",
+    "email_in_progress": "An email operation is already running. Reload the status before retrying.",
     "email_service_unavailable": "The QR email service is unavailable.",
     "qr_generation_failed": "The attendee QR image could not be generated.",
 }
@@ -56,13 +62,13 @@ class AppsScriptSheets:
         self.secret = secret
         self.timeout = timeout
 
-    def _call(self, action, **values):
+    def _call(self, action, timeout=None, **values):
         if not self.url or not self.secret:
             raise SheetsError("Google Sheets is not configured on the server.")
         try:
             response = requests.post(
                 self.url, json={"secret": self.secret, "action": action, **values},
-                timeout=self.timeout, allow_redirects=True,
+                timeout=self.timeout if timeout is None else timeout, allow_redirects=True,
             )
             response.raise_for_status()
             payload = response.json()
@@ -94,11 +100,11 @@ class AppsScriptSheets:
         return self._call("list")
 
     def qr_email_candidates(self):
-        return self._call("qr_email_candidates")
+        return self._call("qr_email_candidates", timeout=6)
 
-    def send_qr_email(self, row_number, qr_token, qr_png_base64):
-        return self._call("send_qr_email", row_number=row_number, token=qr_token,
-                          qr_png_base64=qr_png_base64)
+    def send_qr_email(self, registration_id, qr_token, qr_png_base64, retry_failed=False):
+        return self._call("send_qr_email", timeout=6, registration_id=registration_id, token=qr_token,
+                          qr_png_base64=qr_png_base64, retry_failed=retry_failed)
 
 
 def qr_png_base64(token):
@@ -111,6 +117,152 @@ def qr_png_base64(token):
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
+def mask_email(value):
+    """Return a display-safe email hint without exposing the local part."""
+    if not isinstance(value, str) or "@" not in value:
+        return "Invalid or missing"
+    _local, domain = value.rsplit("@", 1)
+    if not domain or "." not in domain:
+        return "Invalid or missing"
+    return f"***@{domain}"
+
+
+def run_qr_email_batch(sheets, body, config, error_messages, error_response,
+                       qr_factory, test_limit):
+    """Validate trusted sheet candidates and deliver one message per attendee."""
+    if not (config.get("QR_EMAIL_TEST_MODE") or config.get("QR_EMAIL_BULK_ENABLED")):
+        return jsonify(error=error_messages["email_test_disabled"],
+                       code="email_test_disabled"), 404
+    if not isinstance(body, dict) or body.get("confirm_send") is not True:
+        return jsonify(error=error_messages["email_confirmation_required"],
+                       code="email_confirmation_required"), 400
+    action = body.get("action")
+    if action not in {"all", "selected", "retry_failed"}:
+        return jsonify(error="Choose a valid email action.", code="invalid_action"), 400
+    selected_ids = body.get("registration_ids", [])
+    if action == "selected" and (not isinstance(selected_ids, list) or not selected_ids or
+            len(selected_ids) > QR_EMAIL_BATCH_LIMIT or any(not isinstance(value, str) or
+            not 1 <= len(value.strip()) <= 80 for value in selected_ids) or
+            len({value.strip() for value in selected_ids}) != len(selected_ids)):
+        return jsonify(error=error_messages["email_invalid_selection"],
+                       code="email_invalid_selection"), 400
+    try:
+        result = sheets.qr_email_candidates()
+    except SheetsError:
+        return jsonify(error="QR email candidates could not be loaded.",
+                       code="email_service_unavailable"), 502
+    if result.get("error"):
+        return error_response(result)
+    candidates = result.get("candidates", [])
+    if not isinstance(candidates, list):
+        return jsonify(error="QR email candidates could not be loaded.",
+                       code="email_service_unavailable"), 502
+    candidates = [item for item in candidates if isinstance(item, dict)]
+    if config.get("QR_EMAIL_TEST_MODE"):
+        allowed = config.get("QR_EMAIL_TEST_RECIPIENTS", set())
+        candidates = [item for item in candidates if item.get("email_valid") is True and
+                      str(item.get("email", "")).strip().lower() in allowed][:test_limit]
+
+    by_id = {}
+    duplicate_ids = set()
+    for candidate in candidates:
+        registration_id = candidate.get("registration_id")
+        if not isinstance(registration_id, str) or not registration_id.strip():
+            continue
+        if registration_id in by_id:
+            duplicate_ids.add(registration_id)
+        else:
+            by_id[registration_id] = candidate
+    if action == "selected":
+        normalized = [value.strip() for value in selected_ids]
+        if any(value not in by_id or value in duplicate_ids for value in normalized):
+            return jsonify(error=error_messages["email_invalid_selection"],
+                           code="email_invalid_selection"), 400
+        requested = [by_id[value] for value in normalized]
+    elif action == "retry_failed":
+        requested = [item for item in candidates if item.get("email_status") == "Failed"]
+    else:
+        requested = list(candidates)
+
+    remaining_count = max(0, len(requested) - QR_EMAIL_BATCH_LIMIT)
+    if action in {"all", "retry_failed"}:
+        requested = requested[:QR_EMAIL_BATCH_LIMIT]
+    selected_count = len(requested)
+    sent_count = failed_count = skipped_count = manual_review_count = processed_count = eligible_count = 0
+    outcomes = []
+    for candidate in requested:
+        reg_id = candidate.get("registration_id", "")
+        status = candidate.get("email_status") or "Pending"
+        if reg_id in duplicate_ids or not candidate.get("email_valid"):
+            skipped_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Skipped",
+                             "reason": "invalid_email" if not candidate.get("email_valid") else "duplicate_registration"})
+            continue
+        if status == "Sent" or status == "Sending" or status not in {"Pending", "Failed"}:
+            skipped_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Skipped",
+                             "reason": "already_sent" if status == "Sent" else "attempt_in_progress"})
+            continue
+        if action == "retry_failed" and status != "Failed":
+            skipped_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Skipped", "reason": "not_failed"})
+            continue
+        token = candidate.get("qr_token", "")
+        if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
+            skipped_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Skipped", "reason": "invalid_qr"})
+            continue
+        eligible_count += 1
+        processed_count += 1
+        try:
+            image_data = qr_factory(token)
+        except Exception:
+            failed_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Failed", "reason": "qr_generation_failed"})
+            continue
+        try:
+            send_result = sheets.send_qr_email(
+                reg_id, token, image_data,
+                retry_failed=(status == "Failed"),
+            )
+        except SheetsError:
+            # A network timeout can happen after provider acceptance. Do not retry
+            # automatically; keep this outcome distinct for coordinator review.
+            manual_review_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Review", "reason": "outcome_unknown"})
+            continue
+        if send_result.get("sent") is True and send_result.get("email_status") == "Sent":
+            sent_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Sent"})
+        elif send_result.get("error"):
+            if send_result.get("code") == "email_already_attempted":
+                skipped_count += 1
+                outcomes.append({"registration_id": reg_id, "status": "Skipped", "reason": "already_attempted"})
+            elif send_result.get("code") == "email_in_progress":
+                skipped_count += 1
+                outcomes.append({"registration_id": reg_id, "status": "Skipped", "reason": "attempt_in_progress"})
+            elif send_result.get("code") == "email_invalid_recipient":
+                skipped_count += 1
+                outcomes.append({"registration_id": reg_id, "status": "Skipped", "reason": "invalid_email"})
+            elif send_result.get("code") == "email_ambiguous_outcome":
+                manual_review_count += 1
+                outcomes.append({"registration_id": reg_id, "status": "Review", "reason": "outcome_unknown"})
+            else:
+                failed_count += 1
+                code = send_result.get("code")
+                safe_code = code if code in {"email_quota_exhausted", "email_delivery_failed", "qr_generation_failed"} else "email_delivery_failed"
+                outcomes.append({"registration_id": reg_id, "status": "Failed", "reason": safe_code})
+        else:
+            manual_review_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Review", "reason": "outcome_unknown"})
+    return jsonify(action=action, selected_count=selected_count, eligible_count=eligible_count,
+                   processed_count=processed_count,
+                   sent_count=sent_count, failed_count=failed_count,
+                   skipped_count=skipped_count, manual_review_count=manual_review_count,
+                   remaining_count=remaining_count,
+                   outcomes=outcomes), 200
+
+
 def create_app(test_config=None, sheets_client=None):
     app = Flask(__name__)
     app.config.update(
@@ -119,6 +271,8 @@ def create_app(test_config=None, sheets_client=None):
         GOOGLE_APPS_SCRIPT_URL=os.environ.get("GOOGLE_APPS_SCRIPT_URL", ""),
         GOOGLE_APPS_SCRIPT_SECRET=os.environ.get("GOOGLE_APPS_SCRIPT_SECRET", ""),
         QR_EMAIL_TEST_MODE=os.environ.get("QR_EMAIL_TEST_MODE", "false").lower() == "true",
+        QR_EMAIL_BULK_ENABLED=os.environ.get("QR_EMAIL_BULK_ENABLED", "false").lower() == "true",
+        QR_EMAIL_TEST_RECIPIENTS=os.environ.get("QR_EMAIL_TEST_RECIPIENTS", ""),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
@@ -126,6 +280,13 @@ def create_app(test_config=None, sheets_client=None):
     )
     if test_config:
         app.config.update(test_config)
+    configured_test_recipients = app.config.get("QR_EMAIL_TEST_RECIPIENTS", "")
+    if isinstance(configured_test_recipients, str):
+        configured_test_recipients = configured_test_recipients.split(",")
+    app.config["QR_EMAIL_TEST_RECIPIENTS"] = {
+        value.strip().lower() for value in configured_test_recipients
+        if isinstance(value, str) and value.strip()
+    }
     if app.config.get("SECRET_KEY"):
         app.secret_key = app.config["SECRET_KEY"]
     login_ready = credentials_configured(app.secret_key, app.config["COORDINATOR_PASSWORD"])
@@ -230,9 +391,11 @@ def create_app(test_config=None, sheets_client=None):
     def qr_email_test_page():
         if not session.get("coordinator"):
             return make_response("", 303, {"Location": "/"})
-        if not app.config["QR_EMAIL_TEST_MODE"]:
+        if not (app.config["QR_EMAIL_TEST_MODE"] or app.config["QR_EMAIL_BULK_ENABLED"]):
             return make_response("QR email test mode is disabled.", 404)
-        return render_template("qr_email_test.html", csrf_token=session["csrf_token"])
+        return render_template("qr_email_test.html", csrf_token=session["csrf_token"],
+                               test_mode=app.config["QR_EMAIL_TEST_MODE"],
+                               bulk_enabled=app.config["QR_EMAIL_BULK_ENABLED"])
 
     def qr_email_error(result, default_status=502):
         code = result.get("code") if isinstance(result, dict) else None
@@ -248,12 +411,14 @@ def create_app(test_config=None, sheets_client=None):
             status = 404
         elif code == "email_invalid_image":
             status = 400
+        elif code in {"email_invalid_selection", "email_invalid_recipient", "email_retry_not_allowed"}:
+            status = 400
         return jsonify(error=message, code=code or "email_error"), status
 
     @app.post("/api/qr-email/candidates")
     @authenticated
     def qr_email_candidates():
-        if not app.config["QR_EMAIL_TEST_MODE"]:
+        if not (app.config["QR_EMAIL_TEST_MODE"] or app.config["QR_EMAIL_BULK_ENABLED"]):
             return jsonify(error=QR_EMAIL_ERROR_MESSAGES["email_test_disabled"],
                            code="email_test_disabled"), 404
         try:
@@ -264,22 +429,31 @@ def create_app(test_config=None, sheets_client=None):
         if result.get("error"):
             return qr_email_error(result)
         candidates = result.get("candidates", [])
-        # Defense in depth: never expose or offer more than the fixed test cohort.
+        if not isinstance(candidates, list):
+            return jsonify(error="QR email candidates could not be loaded.",
+                           code="email_service_unavailable"), 502
+        candidates = [item for item in candidates if isinstance(item, dict)]
+        # Test mode is always bounded to the first three valid email recipients.
+        if app.config["QR_EMAIL_TEST_MODE"]:
+            allowed = app.config["QR_EMAIL_TEST_RECIPIENTS"]
+            candidates = [item for item in candidates if item.get("email_valid") is True and
+                          str(item.get("email", "")).strip().lower() in allowed][:QR_EMAIL_TEST_LIMIT]
         safe_candidates = []
-        for item in candidates[:QR_EMAIL_TEST_LIMIT]:
-            status = item.get("email_status") or "Not sent"
-            if status not in {"Not sent", "Sending", "Sent", "Failed"}:
+        for item in candidates:
+            status = item.get("email_status") or "Pending"
+            if status not in {"Pending", "Sending", "Sent", "Failed"}:
                 status = "Unknown"
             error = item.get("email_error", "")
-            if error not in {"", "quota_exhausted", "delivery_failed"}:
+            if error not in {"", "quota_exhausted", "delivery_failed", "outcome_unknown"}:
                 error = ""
             timestamp = item.get("email_timestamp", "")
             if not isinstance(timestamp, str) or len(timestamp) > 40:
                 timestamp = ""
             safe_candidates.append({
-                "row_number": item.get("row_number"),
                 "registration_id": item.get("registration_id", ""),
                 "name": item.get("name", ""),
+                "email": mask_email(item.get("email", "")) if item.get("email_valid") else "Invalid or missing",
+                "email_valid": item.get("email_valid") is True,
                 "email_status": status,
                 "email_timestamp": timestamp,
                 "email_error": error,
@@ -289,49 +463,22 @@ def create_app(test_config=None, sheets_client=None):
     @app.post("/api/qr-email/send")
     @authenticated
     def send_qr_email():
-        if not app.config["QR_EMAIL_TEST_MODE"]:
-            return jsonify(error=QR_EMAIL_ERROR_MESSAGES["email_test_disabled"],
-                           code="email_test_disabled"), 404
         body = request.get_json(silent=True)
-        if not isinstance(body, dict):
-            return jsonify(error="Invalid request.", code="invalid_request"), 400
-        row_number = body.get("row_number")
-        if (not isinstance(row_number, int) or isinstance(row_number, bool) or
-                row_number < 2 or body.get("confirm_send") is not True):
-            return jsonify(error="Confirm one eligible attendee email.",
+        if not isinstance(body, dict) or not isinstance(body.get("registration_id"), str):
+            return jsonify(error=QR_EMAIL_ERROR_MESSAGES["email_confirmation_required"],
                            code="email_confirmation_required"), 400
-        try:
-            result = sheets.qr_email_candidates()
-        except SheetsError:
-            return jsonify(error="QR email candidates could not be loaded.",
-                           code="email_service_unavailable"), 502
-        if result.get("error"):
-            return qr_email_error(result)
-        candidates = result.get("candidates", [])[:QR_EMAIL_TEST_LIMIT]
-        candidate = next((item for item in candidates
-                          if item.get("row_number") == row_number), None)
-        if not candidate:
-            return qr_email_error({"code": "email_not_eligible"}, 404)
-        if candidate.get("email_status"):
-            return qr_email_error({"code": "email_already_attempted"}, 409)
-        token = candidate.get("qr_token", "")
-        if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
-            return qr_email_error({"code": "email_not_eligible"}, 400)
-        try:
-            image_data = qr_png_base64(token)
-        except Exception:
-            return jsonify(error="The attendee QR image could not be generated.",
-                           code="qr_generation_failed"), 500
-        try:
-            result = sheets.send_qr_email(row_number, token, image_data)
-        except SheetsError:
-            return jsonify(error="The QR email service could not be reached.",
-                           code="email_service_unavailable"), 502
-        if result.get("error"):
-            return qr_email_error(result)
-        return jsonify(message="The individual QR email was sent.",
-                       email_status=result.get("email_status", "Sent"),
-                       email_timestamp=result.get("email_timestamp", ""))
+        single = {"action": "selected", "registration_ids": [body["registration_id"]],
+                  "confirm_send": body.get("confirm_send")}
+        return run_qr_email_batch(sheets, single, app.config,
+                                  QR_EMAIL_ERROR_MESSAGES, qr_email_error,
+                                  qr_png_base64, QR_EMAIL_TEST_LIMIT)
+
+    @app.post("/api/qr-email/batch")
+    @authenticated
+    def send_qr_email_batch():
+        return run_qr_email_batch(sheets, request.get_json(silent=True), app.config,
+                                  QR_EMAIL_ERROR_MESSAGES, qr_email_error,
+                                  qr_png_base64, QR_EMAIL_TEST_LIMIT)
 
     @app.post("/api/lookup")
     @authenticated
@@ -357,6 +504,99 @@ def create_app(test_config=None, sheets_client=None):
         if not isinstance(body, dict):
             return jsonify(error="Invalid request.", code="invalid_request"), 400
         token = body.get("token")
+        if "checkpoints" in body:
+            if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
+                return jsonify(error="This QR code is not valid.", code="invalid_qr"), 400
+            selections = body.get("checkpoints")
+            if not isinstance(selections, list) or not 1 <= len(selections) <= len(ALLOWED_CHECKPOINTS):
+                return jsonify(error="Select one or more valid checkpoints.", code="invalid_checkpoints"), 400
+            requested = []
+            seen = set()
+            for selection in selections:
+                if not isinstance(selection, dict):
+                    return jsonify(error="Invalid checkpoint selection.", code="invalid_checkpoints"), 400
+                checkpoint_key = selection.get("checkpoint")
+                expected = selection.get("expected_status")
+                if (not isinstance(checkpoint_key, str) or checkpoint_key not in ALLOWED_CHECKPOINTS or
+                        checkpoint_key in seen or not isinstance(expected, str) or
+                        expected not in ALLOWED_STATUSES):
+                    return jsonify(error="Invalid or duplicate checkpoint selection.",
+                                   code="invalid_checkpoints"), 400
+                requested.append((checkpoint_key, expected))
+                seen.add(checkpoint_key)
+
+            updated = []
+            already_present = []
+            failure = None
+            http_status = 409
+            try:
+                # Apps Script checks each expected status atomically under its own lock.
+                # The local lock also prevents this app worker from interleaving its batch.
+                with update_lock:
+                    current_result = sheets.lookup(token)
+                    if current_result.get("not_found") or not current_result.get("attendee"):
+                        return jsonify(error="QR code was not found in this event.",
+                                       code="unknown_qr", updated_checkpoints=[],
+                                       already_present=[]), 404
+                    attendee = current_result["attendee"]
+                    for checkpoint_key, expected in requested:
+                        actual = attendee.get(checkpoint_key, "Registered")
+                        if actual not in ALLOWED_STATUSES:
+                            failure = (checkpoint_key, "invalid_current_status",
+                                       "A selected checkpoint has an unsupported status.", None)
+                            http_status = 502
+                            break
+                        if actual == "Present":
+                            already_present.append(checkpoint_key)
+                            continue
+                        if actual != expected:
+                            failure = (checkpoint_key, "conflict",
+                                       "Attendance changed since it was loaded. Review and retry.", actual)
+                            http_status = 409
+                            break
+                        result = sheets.update(token, checkpoint_key, "Present", expected)
+                        if result.get("not_found"):
+                            failure = (checkpoint_key, "unknown_qr",
+                                       "QR code was not found in this event.", None)
+                            http_status = 404
+                            break
+                        if result.get("conflict"):
+                            if result.get("current_status") == "Present":
+                                already_present.append(checkpoint_key)
+                                continue
+                            failure = (checkpoint_key, "conflict",
+                                       "Attendance changed since it was loaded. Review and retry.",
+                                       result.get("current_status"))
+                            http_status = 409
+                            break
+                        if result.get("duplicate"):
+                            already_present.append(checkpoint_key)
+                        elif result.get("updated"):
+                            updated.append(checkpoint_key)
+                        else:
+                            failure = (checkpoint_key, "sheets_error",
+                                       "Google Sheets returned an incomplete checkpoint result.", None)
+                            http_status = 502
+                            break
+            except SheetsError:
+                completed_keys = set(updated) | set(already_present)
+                failed_checkpoint = next(
+                    (key for key, _expected in requested if key not in completed_keys), None
+                )
+                failure = (failed_checkpoint, "sheets_error",
+                           "Google Sheets could not complete this checkpoint update. Retry safely.", None)
+                http_status = 502
+
+            if failure:
+                failed_checkpoint, code, error, current_status = failure
+                partial = bool(updated or already_present)
+                return jsonify(success=False, error=error, code=code, partial=partial,
+                               updated_checkpoints=updated, already_present=already_present,
+                               failed_checkpoint=failed_checkpoint,
+                               current_status=current_status), http_status
+            return jsonify(success=True, updated_checkpoints=updated,
+                           already_present=already_present, failed_checkpoint=None)
+
         checkpoint, status = body.get("checkpoint"), body.get("status")
         expected_status = body.get("expected_status")
         if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):

@@ -4,21 +4,37 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <title>QR email test · QRTS</title>
+  <title>QR Email Management · QRTS</title>
   <link rel="stylesheet" href="/static/app.css">
   <script defer src="/static/qr_email_test.js"></script>
 </head>
 <body>
-  <header class="topbar"><strong>QRTS · Individual QR email test</strong><a class="quiet-link" href="/">Back to attendance</a></header>
-  <main class="layout">
-    <section class="intro"><span class="eyebrow">TEST MODE · MAXIMUM 3 RECIPIENTS</span><h1>Send individual QR email</h1>
-      <p>Each message goes separately to the email saved on that attendee’s own Sheet row. Addresses are not shown on this page.</p></section>
-    <section class="card warning" role="note"><strong>This sends real email.</strong> Use only dummy/test addresses in the first three eligible rows. Each row can be attempted once; failed attempts are not automatically retried.</section>
-    <section class="card"><div class="section-heading"><div><h2>Eligible test rows</h2><p class="muted">First three rows with a name, registration ID, valid email, and existing valid QR token.</p></div><button class="secondary" id="reload">Reload</button></div>
-      <div id="message" class="notice" aria-live="polite" hidden></div>
-      <div id="candidates" class="email-candidates" aria-live="polite"></div>
+  <header class="topbar"><strong>QRTS · QR Email Management</strong><a class="quiet-link" href="/">Back to attendance</a></header>
+  <main class="layout qr-email-management" data-test-mode="{{ 'true' if test_mode else 'false' }}">
+    <section class="intro"><span class="eyebrow">COORDINATOR TOOL</span><h1>QR Email Management</h1>
+      <p>Each attendee receives a separate message with the QR image generated from their existing token. The provider accepting a message does not confirm inbox delivery.</p></section>
+    {% if test_mode %}
+    <section class="card warning" role="note"><strong>Test Mode is on.</strong> Every send action is limited server-side to the first 3 attendees with valid email addresses. Use approved test inboxes only.</section>
+    {% else %}
+    <section class="card warning" role="note"><strong>Bulk email is enabled.</strong> This can send to real attendees. Sent rows are skipped by default. Failed rows are retried only through Retry Failed.</section>
+    {% endif %}
+    <section class="card">
+      <div class="section-heading"><div><h2>Attendees</h2><p class="muted">Email addresses are masked. QR tokens and attendance fields are never shown here.</p></div><button class="secondary" id="reload" type="button">Reload</button></div>
+      <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
+      <div class="email-table-wrap">
+        <table class="email-table">
+          <thead><tr><th><input id="select-all" type="checkbox" aria-label="Select eligible attendees"></th><th>Registration ID</th><th>Name</th><th>Email</th><th>QR Email Status</th></tr></thead>
+          <tbody id="candidate-rows"></tbody>
+        </table>
+      </div>
+      <div class="email-actions">
+        <button id="send-all" class="primary" type="button">Send to All</button>
+        <button id="send-selected" class="secondary" type="button">Send to Selected</button>
+        <button id="retry-failed" class="secondary" type="button">Retry Failed</button>
+      </div>
+      <p class="fine">Pending rows are sent once per attendee. Rows already marked Sent are skipped. Retry Failed only retries rows whose previous attempt was recorded as Failed. An ambiguous Sending result is held for manual review to prevent duplicates.</p>
     </section>
-    <footer>QR tokens and attendance cells are not changed by this email tool.</footer>
+    <footer>QR email tracking is stored in the three dedicated QR Email columns. Attendance and existing QR tokens are not changed.</footer>
   </main>
 </body>
 </html>

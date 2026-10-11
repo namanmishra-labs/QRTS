@@ -9,94 +9,91 @@ class FakeElement {
     this.disabled = false;
     this.hidden = false;
     this.checked = false;
-    this.video = null;
     this.textContent = '';
     this.className = '';
+    this.inert = false;
+    this.video = null;
+    this.attributes = {};
   }
   addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes[name] = value; }
   querySelector(selector) { return selector === 'video' ? this.video : null; }
-  scrollIntoView() {}
   focus() {}
   get classList() {
     return {
       add: (name) => this.classNames.add(name),
       remove: (name) => this.classNames.delete(name),
-      toggle: (name, force) => force ? this.classNames.add(name) : this.classNames.delete(name),
     };
   }
 }
 
-async function runScenario({failures = [], cameras = [], makeVideo = true, fetchImpl, confirm = () => true} = {}) {
+async function runScenario({failures = [], cameras = [], fetchImpl} = {}) {
   const ids = [
-    'start-scan', 'stop-scan', 'switch-camera', 'notice', 'main', 'attendance-modal', 'checkpoint-section',
-    'reader', 'camera-help', 'confirm-update', 'logout', 'mark-present', 'modal-feedback', 'cancel-scan',
-    'attendee-name', 'attendee-id',
+    'main', 'start-scan', 'stop-scan', 'switch-camera', 'reader', 'notice',
+    'attendance-modal', 'attendee-name', 'attendee-id', 'modal-feedback', 'toast',
+    'confirm-update', 'cancel-scan',
   ];
   const elements = Object.fromEntries(ids.map((id) => [`#${id}`, new FakeElement()]));
   elements['#attendance-modal'].hidden = true;
-  const checkpoints = ['day1_morning', 'day1_evening', 'day2_morning', 'day2_evening'].map((value) => {
-    const item = new FakeElement(); item.value = value; return item;
+  elements['#modal-feedback'].hidden = true;
+  const checkpointOptions = [
+    'day1_morning', 'day1_evening', 'day2_morning', 'day2_evening',
+  ].map((value) => {
+    const option = new FakeElement();
+    option.value = value;
+    return option;
   });
-  checkpoints[0].checked = true;
   const reader = elements['#reader'];
   const calls = [];
   const instances = [];
+  const timers = [];
+  const setTimer = (callback, delay) => {
+    const timer = {callback, delay, cancelled: false};
+    timers.push(timer);
+    return timer;
+  };
+  const clearTimer = (timer) => { if (timer) timer.cancelled = true; };
+
   class MockScanner {
     constructor() { this.id = instances.length + 1; instances.push(this); }
-    async start(camera, _config, _success, _error) {
-      this.onScan = _success;
+    async start(camera, _config, success, _error) {
+      this.onScan = success;
       calls.push({op: 'start', instance: this.id, camera});
       const failure = failures.shift();
       if (failure) throw failure;
-      if (makeVideo) {
-        const actualFacing = typeof camera === 'string'
-          ? (cameras.find((item) => item.id === camera) || {}).facingMode || 'user'
-          : camera.facingMode;
-        reader.video = {
-          srcObject: {getVideoTracks: () => [{
-            readyState: 'live', getSettings: () => ({facingMode: actualFacing}),
-          }]},
-          readyState: 2,
-          videoWidth: 640,
-          videoHeight: 480,
-          paused: true,
-          async play() { this.paused = false; },
-        };
-      }
+      const facing = typeof camera === 'string'
+        ? (cameras.find((entry) => entry.id === camera) || {}).facingMode || 'user'
+        : camera.facingMode;
+      reader.video = {
+        srcObject: {getVideoTracks: () => [{
+          readyState: 'live', getSettings: () => ({facingMode: facing}),
+        }]},
+        readyState: 2, videoWidth: 640, videoHeight: 480, paused: true,
+        async play() { this.paused = false; },
+      };
     }
     async stop() { calls.push({op: 'stop', instance: this.id}); }
-    async clear() {
-      calls.push({op: 'clear', instance: this.id});
-      reader.video = null;
-    }
+    async clear() { calls.push({op: 'clear', instance: this.id}); reader.video = null; }
     static async getCameras() { return cameras; }
   }
+
   const context = {
     document: {
       querySelector: (selector) => selector === 'meta[name="csrf-token"]'
-        ? {content: 'test-csrf'} : (selector === 'main' ? elements['#main'] : elements[selector]),
-      querySelectorAll: (selector) => selector === 'input[name="checkpoint"]' ? checkpoints : [],
+        ? {content: 'mock-csrf'} : (selector === 'main' ? elements['#main'] : elements[selector]),
+      querySelectorAll: (selector) => selector === 'input[name="attendance-checkpoint"]'
+        ? checkpointOptions : [],
       addEventListener() {},
     },
-    window: {
-      Html5Qrcode: MockScanner,
-      setTimeout,
-      addEventListener() {},
-      confirm,
-      location: {assign() {}},
-    },
-    navigator: {mediaDevices: {getUserMedia: async () => { throw new Error('library handles camera access'); }}},
+    window: {Html5Qrcode: MockScanner, setTimeout: setTimer, clearTimeout: clearTimer,
+      addEventListener() {}, location: {assign() {}}},
+    navigator: {mediaDevices: {getUserMedia: async () => { throw new Error('scanner library owns camera access'); }}},
     Html5Qrcode: MockScanner,
     fetch: fetchImpl || (async () => ({ok: true, json: async () => ({})})),
-    setTimeout,
-    clearTimeout,
-    Date,
-    Promise,
-    Error,
-    JSON,
+    setTimeout: setTimer, clearTimeout: clearTimer, Date, Promise, Error, JSON,
   };
   vm.runInNewContext(fs.readFileSync('static/app.js', 'utf8'), context);
-  return {elements, calls, instances, checkpoints};
+  return {elements, checkpointOptions, calls, instances, timers};
 }
 
 function startCall(calls, index = 0) {
@@ -104,133 +101,154 @@ function startCall(calls, index = 0) {
 }
 
 (async () => {
-  const normal = await runScenario();
-  const starting = normal.elements['#start-scan'].listeners.click();
-  assert.equal(normal.elements['#switch-camera'].disabled, true, 'switch is disabled during startup');
-  await starting;
-  assert.equal(startCall(normal.calls).camera.facingMode, 'environment', 'rear camera is the default');
-  assert.match(normal.elements['#notice'].textContent, /Back camera ready/);
+  const cameras = await runScenario();
+  assert.equal(cameras.elements['#switch-camera'].hidden, true, 'camera switch hidden before scanner starts');
+  assert.equal(cameras.elements['#stop-scan'].disabled, true, 'stop disabled before scanner starts');
+  await cameras.elements['#start-scan'].listeners.click();
+  assert.equal(startCall(cameras.calls).camera.facingMode, 'environment', 'rear camera is default');
+  assert.equal(cameras.elements['#switch-camera'].hidden, false, 'switch appears after live preview succeeds');
+  assert.equal(cameras.elements['#switch-camera'].textContent, 'Change Camera');
+  assert.equal(cameras.elements['#stop-scan'].disabled, false);
 
-  const switchingFront = normal.elements['#switch-camera'].listeners.click();
-  assert.equal(normal.elements['#switch-camera'].disabled, true, 'switch is disabled during camera change');
-  const duplicateSwitch = normal.elements['#switch-camera'].listeners.click();
-  await Promise.all([switchingFront, duplicateSwitch]);
-  assert.equal(startCall(normal.calls, 1).camera.facingMode, 'user', 'first switch selects front');
-  assert.equal(normal.elements['#switch-camera'].textContent, 'Switch to Back Camera');
-  const firstStop = normal.calls.findIndex((call) => call.op === 'stop' && call.instance === 1);
-  const firstClear = normal.calls.findIndex((call) => call.op === 'clear' && call.instance === 1);
-  const frontStart = normal.calls.findIndex((call) => call.op === 'start' && call.instance === 2);
-  assert.ok(firstStop >= 0 && firstClear > firstStop && frontStart > firstClear,
-    'old rear scanner must stop and clear before front scanner starts');
-
-  await normal.elements['#switch-camera'].listeners.click();
-  assert.equal(startCall(normal.calls, 2).camera.facingMode, 'environment', 'second switch returns to rear');
-  assert.equal(normal.elements['#switch-camera'].textContent, 'Switch to Front Camera');
+  await cameras.elements['#switch-camera'].listeners.click();
+  assert.equal(startCall(cameras.calls, 1).camera.facingMode, 'user', 'camera switch selects front');
+  const oldStop = cameras.calls.findIndex((entry) => entry.op === 'stop' && entry.instance === 1);
+  const oldClear = cameras.calls.findIndex((entry) => entry.op === 'clear' && entry.instance === 1);
+  const frontStart = cameras.calls.findIndex((entry) => entry.op === 'start' && entry.instance === 2);
+  assert.ok(oldStop >= 0 && oldClear > oldStop && frontStart > oldClear, 'old stream is cleaned before switching');
+  await cameras.elements['#switch-camera'].listeners.click();
+  assert.equal(startCall(cameras.calls, 2).camera.facingMode, 'environment', 'switch returns to rear');
+  await cameras.elements['#stop-scan'].listeners.click();
+  assert.equal(cameras.elements['#switch-camera'].hidden, true, 'camera switch hidden after stopping');
 
   const attendee = {
     registration_id: 'REG-TEST', name: 'Test Attendee',
-    day1_morning: 'Present', day1_evening: 'Registered',
+    day1_morning: 'Registered', day1_evening: 'Present',
     day2_morning: 'Registered', day2_evening: 'Present',
   };
-  const sent = [];
-  let resolveUpdate;
-  const appFlow = await runScenario({fetchImpl: async (path, options) => {
+  const requests = [];
+  let resolveBatch;
+  let batchAttempts = 0;
+  const flow = await runScenario({fetchImpl: async (path, options) => {
     const body = JSON.parse(options.body);
-    sent.push(body);
+    requests.push({path, body});
     if (path === '/api/lookup') return {ok: true, json: async () => ({attendee})};
-    return await new Promise((resolve) => { resolveUpdate = resolve; });
+    batchAttempts += 1;
+    if (batchAttempts === 1) return await new Promise((resolve) => { resolveBatch = resolve; });
+    return {ok: true, json: async () => ({success: true, updated_checkpoints: ['day2_evening'], already_present: ['day1_morning']})};
   }});
-  await appFlow.elements['#start-scan'].listeners.click();
-  await appFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  assert.equal(appFlow.elements['#attendee-name'].textContent, 'Test Attendee');
-  assert.equal(appFlow.elements['#attendee-id'].textContent, 'REG-TEST');
-  assert.equal(appFlow.elements['#attendance-modal'].hidden, false, 'valid attendee opens modal');
-  assert.equal(appFlow.elements['#mark-present'].checked, false, 'checkbox defaults unchecked');
-  appFlow.checkpoints.forEach((option) => { option.checked = option.value === 'day2_evening'; });
-  appFlow.checkpoints[3].listeners.change();
-  const submit = appFlow.elements['#confirm-update'].listeners.click;
-  const firstSubmit = submit({currentTarget: appFlow.elements['#confirm-update']});
-  const secondSubmit = submit({currentTarget: appFlow.elements['#confirm-update']});
-  assert.equal(sent.length, 2, 'only lookup plus one attendance request despite duplicate clicks');
-  assert.equal(sent[1].checkpoint, 'day2_evening');
-  assert.equal(sent[1].status, 'Registered', 'unchecked checkbox maps to Registered');
-  assert.equal(sent[1].expected_status, 'Present');
-  assert.equal(Object.keys(sent[1]).filter((key) => key === 'checkpoint').length, 1);
-  resolveUpdate({ok: true, json: async () => ({status: 'Registered', duplicate: false})});
-  await Promise.all([firstSubmit, secondSubmit]);
-  assert.equal(appFlow.elements['#attendance-modal'].hidden, true, 'success closes modal');
-  assert.equal(appFlow.elements['#mark-present'].checked, false, 'success resets checkbox');
-  assert.equal(appFlow.elements['#start-scan'].textContent, 'Scan Next Attendee');
-  assert.equal(appFlow.elements['#attendee-name'].textContent, '', 'success clears attendee identity');
-  assert.match(appFlow.elements['#notice'].textContent, /updated successfully/i);
-  await appFlow.elements['#start-scan'].listeners.click();
-  assert.equal(appFlow.instances.length, 2, 'next attendee scan can start immediately');
+  await flow.elements['#start-scan'].listeners.click();
+  await flow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(flow.elements['#attendance-modal'].hidden, false, 'valid QR opens modal');
+  assert.equal(flow.elements['#attendee-name'].textContent, 'Test Attendee');
+  assert.equal(flow.elements['#attendee-id'].textContent, 'REG-TEST');
+  assert.ok(flow.checkpointOptions.every((option) => !option.checked), 'all checkpoint boxes start unchecked');
+  assert.equal(flow.elements['#switch-camera'].hidden, true, 'switch hidden during verified attendee processing');
 
-  let presentRequest;
-  const presentFlow = await runScenario({fetchImpl: async (path, options) => {
-    if (path === '/api/lookup') return {ok: true, json: async () => ({attendee})};
-    presentRequest = JSON.parse(options.body);
-    return {ok: true, json: async () => ({status: 'Present', duplicate: false})};
-  }});
-  await presentFlow.elements['#start-scan'].listeners.click();
-  await presentFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  presentFlow.elements['#mark-present'].checked = true;
-  await presentFlow.elements['#confirm-update'].listeners.click();
-  assert.equal(presentRequest.status, 'Present', 'checked checkbox maps to Present');
-  assert.equal(presentFlow.elements['#attendance-modal'].hidden, true, 'checked checkbox submits Present');
+  await flow.elements['#confirm-update'].listeners.click();
+  assert.equal(requests.length, 1, 'zero selected checkpoints prevent request');
+  assert.match(flow.elements['#modal-feedback'].textContent, /at least one checkpoint/i);
+
+  flow.checkpointOptions[0].checked = true;
+  flow.checkpointOptions[3].checked = true;
+  const submit = flow.elements['#confirm-update'].listeners.click;
+  const firstAttempt = submit();
+  const duplicateAttempt = submit();
+  assert.equal(requests.length, 2, 'only lookup plus one batch request despite duplicate submit');
+  assert.deepEqual(requests[1].body.checkpoints, [
+    {checkpoint: 'day1_morning', expected_status: 'Registered'},
+    {checkpoint: 'day2_evening', expected_status: 'Present'},
+  ], 'only checked checkpoints are submitted with stale-status values');
+  assert.ok(requests[1].body.checkpoints.every((entry) => !('status' in entry) || entry.status === 'Present'));
+  resolveBatch({ok: false, json: async () => ({
+    success: false, partial: true, code: 'conflict',
+    updated_checkpoints: ['day1_morning'], already_present: [], failed_checkpoint: 'day2_evening',
+    current_status: 'Registered',
+    error: 'Attendance changed since it was loaded.',
+  })});
+  await Promise.all([firstAttempt, duplicateAttempt]);
+  assert.equal(flow.elements['#attendance-modal'].hidden, false, 'partial failure keeps modal open');
+  assert.ok(flow.checkpointOptions[0].checked && flow.checkpointOptions[3].checked, 'failure preserves selections');
+  assert.match(flow.elements['#modal-feedback'].textContent, /Partial update/);
+  assert.match(flow.elements['#modal-feedback'].textContent, /Day 1 — Morning/);
+
+  await flow.elements['#confirm-update'].listeners.click();
+  assert.equal(requests.length, 3, 'retry is allowed after partial failure');
+  assert.equal(requests[2].body.checkpoints.length, 2);
+  assert.equal(requests[2].body.checkpoints[1].expected_status, 'Registered',
+    'retry uses the server-confirmed current status after a conflict');
+  assert.equal(flow.elements['#attendance-modal'].hidden, true, 'successful retry closes modal');
+  assert.ok(flow.checkpointOptions.every((option) => !option.checked), 'success clears all selections');
+  assert.equal(flow.elements['#attendee-name'].textContent, '', 'success clears attendee identity');
+  assert.match(flow.elements['#notice'].textContent, /Attendance marked Present/);
+  assert.equal(flow.elements['#toast'].textContent, 'Attendance marked Present for 2 checkpoints');
+  assert.equal(flow.elements['#toast'].className, 'toast success');
+  assert.equal(flow.elements['#toast'].attributes['aria-live'], 'polite');
+  assert.equal(flow.timers.at(-1).delay, 3000, 'success toast dismisses after three seconds');
+  flow.timers.at(-1).callback();
+  assert.equal(flow.elements['#toast'].hidden, true, 'success toast auto-dismisses');
+  assert.equal(flow.elements['#start-scan'].disabled, false, 'scanner can be restarted');
+
+  const failedSubmit = await runScenario({fetchImpl: async (path) => path === '/api/lookup'
+    ? {ok: true, json: async () => ({attendee})}
+    : {ok: false, json: async () => ({success: false, code: 'sheets_error',
+      error: 'Google Sheets could not complete this checkpoint update.', updated_checkpoints: [],
+      already_present: []})}});
+  await failedSubmit.elements['#start-scan'].listeners.click();
+  await failedSubmit.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  failedSubmit.checkpointOptions[1].checked = true;
+  await failedSubmit.elements['#confirm-update'].listeners.click();
+  assert.equal(failedSubmit.elements['#toast'].className, 'toast error');
+  assert.equal(failedSubmit.elements['#toast'].textContent, 'Attendance update failed. Please retry.');
+  assert.equal(failedSubmit.elements['#toast'].attributes['aria-live'], 'assertive');
+  assert.equal(failedSubmit.timers.at(-1).delay, 3000, 'error toast dismisses after three seconds');
+  assert.equal(failedSubmit.elements['#attendance-modal'].hidden, false, 'failed update keeps modal open');
+  assert.equal(failedSubmit.checkpointOptions[1].checked, true, 'failed update keeps selection for retry');
+  assert.match(failedSubmit.elements['#modal-feedback'].textContent, /could not complete/i,
+    'retry detail stays visible in modal after toast timeout');
+  failedSubmit.timers.at(-1).callback();
+  assert.equal(failedSubmit.elements['#toast'].hidden, true);
+  assert.equal(failedSubmit.elements['#modal-feedback'].hidden, false);
 
   const invalidFlow = await runScenario({fetchImpl: async () => ({
-    ok: false, json: async () => ({error: 'QR code was not found.', code: 'unknown_qr'}),
+    ok: false, json: async () => ({error: 'not found', code: 'unknown_qr'}),
   })});
   await invalidFlow.elements['#start-scan'].listeners.click();
   await invalidFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  assert.equal(invalidFlow.elements['#attendance-modal'].hidden, true, 'invalid QR does not open attendance modal');
-  assert.match(invalidFlow.elements['#notice'].textContent, /QR code was not found/);
+  assert.equal(invalidFlow.elements['#attendance-modal'].hidden, true, 'invalid QR cannot open modal');
+  assert.match(invalidFlow.elements['#notice'].textContent, /QR not recognized/);
+  assert.equal(invalidFlow.elements['#toast'].className, 'toast error');
+  assert.equal(invalidFlow.elements['#toast'].textContent, 'QR not recognized. Please retry.');
+  const toastTimerCount = invalidFlow.timers.length;
+  await invalidFlow.elements['#start-scan'].listeners.click();
+  await invalidFlow.instances[1].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(invalidFlow.timers.length, toastTimerCount, 'same active toast is not duplicated');
+  assert.equal(invalidFlow.elements['#start-scan'].disabled, false, 'invalid QR can be retried');
 
-  const cancelFlow = await runScenario({fetchImpl: async () => ({ok: true, json: async () => ({attendee})})});
-  await cancelFlow.elements['#start-scan'].listeners.click();
-  await cancelFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  cancelFlow.elements['#mark-present'].checked = true;
-  await cancelFlow.elements['#cancel-scan'].listeners.click();
-  assert.equal(cancelFlow.elements['#attendance-modal'].hidden, true, 'cancel closes modal');
-  assert.equal(cancelFlow.elements['#mark-present'].checked, false, 'cancel resets checkbox');
-  assert.equal(cancelFlow.instances.length, 2, 'cancel resumes scanner without page reload');
-
-  const failedFlow = await runScenario({fetchImpl: async (path) => {
-    if (path === '/api/lookup') return {ok: true, json: async () => ({attendee})};
-    return {ok: false, json: async () => ({error: 'Update failed safely.', code: 'sheets_error'})};
-  }});
-  await failedFlow.elements['#start-scan'].listeners.click();
-  await failedFlow.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  failedFlow.checkpoints.forEach((option) => { option.checked = option.value === 'day1_evening'; });
-  failedFlow.checkpoints[1].listeners.change();
-  failedFlow.elements['#mark-present'].checked = true;
-  await failedFlow.elements['#confirm-update'].listeners.click();
-  assert.equal(failedFlow.elements['#attendance-modal'].hidden, false, 'failed request keeps modal available for retry');
-  assert.match(failedFlow.elements['#modal-feedback'].textContent, /Update failed safely/);
-  assert.equal(failedFlow.elements['#modal-feedback'].className, 'notice error');
-  assert.equal(failedFlow.elements['#mark-present'].checked, true, 'failed request preserves checkbox');
+  const canceled = await runScenario({fetchImpl: async () => ({ok: true, json: async () => ({attendee})})});
+  await canceled.elements['#start-scan'].listeners.click();
+  await canceled.instances[0].onScan('QRTS1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  canceled.checkpointOptions[2].checked = true;
+  await canceled.elements['#cancel-scan'].listeners.click();
+  assert.equal(canceled.elements['#attendance-modal'].hidden, true);
+  assert.ok(canceled.checkpointOptions.every((option) => !option.checked), 'cancel clears modal selections');
 
   const unavailable = await runScenario({
     failures: [Object.assign(new Error('unavailable'), {name: 'NotFoundError'})],
   });
   await unavailable.elements['#start-scan'].listeners.click();
-  assert.match(unavailable.elements['#notice'].textContent, /rear camera could not start/i);
-  assert.equal(unavailable.elements['#notice'].className, 'notice error');
-  assert.equal(unavailable.elements['#start-scan'].disabled, false);
-  assert.equal(unavailable.elements['#switch-camera'].disabled, false);
-  assert.ok(unavailable.calls.some((call) => call.op === 'clear'), 'failed scanner is cleaned up');
-  assert.doesNotMatch(unavailable.elements['#notice'].textContent, /ready/i);
+  assert.match(unavailable.elements['#notice'].textContent, /Rear camera unavailable/i);
+  assert.equal(unavailable.elements['#switch-camera'].hidden, true, 'switch hidden after startup failure');
+  assert.ok(unavailable.calls.some((entry) => entry.op === 'clear'), 'failed scanner is cleaned up');
 
   const laptop = await runScenario({
     failures: [Object.assign(new Error('rear missing'), {name: 'NotFoundError'})],
     cameras: [{id: 'available-camera', label: 'Integrated Camera', facingMode: 'user'}],
   });
   await laptop.elements['#start-scan'].listeners.click();
-  assert.equal(startCall(laptop.calls, 1).camera, 'available-camera', 'fallback selects an available camera');
-  assert.match(laptop.elements['#notice'].textContent, /available camera is running/i);
-  assert.equal(laptop.elements['#switch-camera'].textContent, 'Switch to Back Camera');
-  console.log('scanner camera switching, QR modal and attendance checks passed');
+  assert.equal(startCall(laptop.calls, 1).camera, 'available-camera', 'laptop camera fallback starts');
+  assert.equal(laptop.elements['#switch-camera'].hidden, false);
+  console.log('scanner camera, QR, multi-checkpoint, and toast checks passed');
 })().catch((error) => {
   console.error(error.message);
   process.exitCode = 1;

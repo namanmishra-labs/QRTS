@@ -1,5 +1,6 @@
 import threading
 import unittest
+from pathlib import Path
 
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,7 @@ class FakeSheets:
         }
         self.lock = threading.Lock()
         self.fail = False
+        self.fail_checkpoint = None
 
     def lookup(self, token):
         if self.fail:
@@ -26,6 +28,8 @@ class FakeSheets:
 
     def update(self, token, day, status, expected_status):
         if self.fail:
+            raise SheetsError("Google Sheets could not be reached. Try again.")
+        if self.fail_checkpoint == day:
             raise SheetsError("Google Sheets could not be reached. Try again.")
         with self.lock:
             attendee = self.attendees.get(token)
@@ -46,15 +50,19 @@ class FakeSheets:
             self.email_rows = [
                 {"row_number": 2, "registration_id": "TEST-1", "name": "Test Attendee 1",
                  "email": "attendee1@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000001",
+                 "email_valid": True,
                  "email_status": "", "email_timestamp": "", "email_error": ""},
                 {"row_number": 3, "registration_id": "TEST-2", "name": "Test Attendee 2",
                  "email": "attendee2@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000002",
+                 "email_valid": True,
                  "email_status": "", "email_timestamp": "", "email_error": ""},
                 {"row_number": 4, "registration_id": "TEST-3", "name": "Test Attendee 3",
                  "email": "attendee3@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000003",
+                 "email_valid": True,
                  "email_status": "", "email_timestamp": "", "email_error": ""},
                 {"row_number": 5, "registration_id": "TEST-4", "name": "Outside Test Cohort",
                  "email": "outside@example.test", "qr_token": "QRTS1:00000000-0000-4000-8000-000000000004",
+                 "email_valid": True,
                  "email_status": "", "email_timestamp": "", "email_error": ""},
             ]
         return self.email_rows
@@ -62,15 +70,21 @@ class FakeSheets:
     def qr_email_candidates(self):
         return {"candidates": [dict(row) for row in self._qr_email_rows()]}
 
-    def send_qr_email(self, row_number, qr_token, qr_png_base64):
+    def send_qr_email(self, registration_id, qr_token, qr_png_base64, retry_failed=False):
         row = next((item for item in self._qr_email_rows()
-                    if item["row_number"] == row_number), None)
+                    if item["registration_id"] == registration_id), None)
         if row is None:
             return {"error": True, "code": "email_not_eligible"}
-        if row["email_status"]:
+        if row["email_status"] == "Sent" or row["email_status"] == "Sending":
             return {"error": True, "code": "email_already_attempted"}
+        if row["email_status"] == "Failed" and not retry_failed:
+            return {"error": True, "code": "email_already_attempted"}
+        if registration_id in getattr(self, "fail_email_ids", set()):
+            row["email_status"] = "Failed"
+            row["email_error"] = "delivery_failed"
+            return {"error": True, "code": "email_delivery_failed", "email_status": "Failed"}
         self.email_sends = getattr(self, "email_sends", [])
-        self.email_sends.append({"row_number": row_number, "qr_token": qr_token,
+        self.email_sends.append({"registration_id": registration_id, "qr_token": qr_token,
                                  "qr_png_base64": qr_png_base64})
         row["email_status"] = "Sent"
         row["email_timestamp"] = "test timestamp"
@@ -88,6 +102,9 @@ class AttendanceAppTests(unittest.TestCase):
             "SESSION_COOKIE_SECURE": False,
         }, self.sheets)
         self.app.config["QR_EMAIL_TEST_MODE"] = True
+        self.app.config["QR_EMAIL_TEST_RECIPIENTS"] = {
+            "attendee1@example.test", "attendee2@example.test", "attendee3@example.test"
+        }
         self.client = self.app.test_client()
         self.csrf = ""
 
@@ -166,6 +183,79 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(self.sheets.attendees[self.token]["day2_evening"], "Present")
         self.assertEqual(self.sheets.attendees[self.token]["day2_morning"], "Registered")
         self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
+
+    def test_batch_updates_only_selected_checkpoints_and_is_idempotent(self):
+        self.login()
+        payload = {
+            "token": self.token,
+            "checkpoints": [
+                {"checkpoint": "day1_morning", "expected_status": "Registered"},
+                {"checkpoint": "day2_evening", "expected_status": "Registered"},
+            ],
+        }
+        response = self.post_json("/api/attendance", payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["updated_checkpoints"], ["day1_morning", "day2_evening"])
+        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Present")
+        self.assertEqual(self.sheets.attendees[self.token]["day2_evening"], "Present")
+        self.assertEqual(self.sheets.attendees[self.token]["day1_evening"], "Registered")
+        self.assertEqual(self.sheets.attendees[self.token]["day2_morning"], "Registered")
+        repeated = self.post_json("/api/attendance", payload)
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json["already_present"], ["day1_morning", "day2_evening"])
+        self.assertEqual(repeated.json["updated_checkpoints"], [])
+
+    def test_batch_rejects_empty_duplicate_or_invalid_checkpoint_sets(self):
+        self.login()
+        cases = [
+            [],
+            [{"checkpoint": "day1_morning", "expected_status": "Registered"},
+             {"checkpoint": "day1_morning", "expected_status": "Registered"}],
+            [{"checkpoint": "day3_morning", "expected_status": "Registered"}],
+            [{"checkpoint": "day1_morning", "expected_status": "Absent"}],
+        ]
+        for checkpoints in cases:
+            response = self.post_json("/api/attendance", {"token": self.token, "checkpoints": checkpoints})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(set(self.sheets.attendees[self.token][key] for key in (
+            "day1_morning", "day1_evening", "day2_morning", "day2_evening"
+        )), {"Registered"})
+
+    def test_batch_conflict_reports_partial_updates_and_stops_safely(self):
+        self.login()
+        response = self.post_json("/api/attendance", {
+            "token": self.token,
+            "checkpoints": [
+                {"checkpoint": "day1_morning", "expected_status": "Registered"},
+                {"checkpoint": "day2_evening", "expected_status": "Present"},
+            ],
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(response.json["partial"])
+        self.assertEqual(response.json["updated_checkpoints"], ["day1_morning"])
+        self.assertEqual(response.json["failed_checkpoint"], "day2_evening")
+        self.assertEqual(response.json["code"], "conflict")
+        self.assertEqual(response.json["current_status"], "Registered")
+        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Present")
+        self.assertEqual(self.sheets.attendees[self.token]["day1_evening"], "Registered")
+
+    def test_batch_sheet_failure_reports_partial_outcome_without_claiming_full_success(self):
+        self.login()
+        self.sheets.fail_checkpoint = "day1_evening"
+        response = self.post_json("/api/attendance", {
+            "token": self.token,
+            "checkpoints": [
+                {"checkpoint": "day1_morning", "expected_status": "Registered"},
+                {"checkpoint": "day1_evening", "expected_status": "Registered"},
+            ],
+        })
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(response.json["success"])
+        self.assertTrue(response.json["partial"])
+        self.assertEqual(response.json["updated_checkpoints"], ["day1_morning"])
+        self.assertEqual(response.json["failed_checkpoint"], "day1_evening")
+        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Present")
+        self.assertEqual(self.sheets.attendees[self.token]["day1_evening"], "Registered")
 
     def test_existing_attendance_can_be_corrected_without_old_status_confirmation(self):
         self.login()
@@ -262,13 +352,17 @@ class AttendanceAppTests(unittest.TestCase):
             "expected_status": "Registered",
         })
 
-    def test_checkin_page_lists_all_four_independent_checkpoints(self):
+    def test_checkin_initial_screen_is_scanner_only_and_switch_is_hidden(self):
         self.login()
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        for checkpoint in ("day1_morning", "day1_evening", "day2_morning", "day2_evening"):
-            self.assertIn(checkpoint.encode(), response.data)
-        self.assertIn(b"value=\"day1_morning\"><span>Day 1<br><strong>Morning", response.data)
+        self.assertIn(b'id="reader"', response.data)
+        self.assertIn(b'id="start-scan"', response.data)
+        self.assertIn(b'id="stop-scan"', response.data)
+        self.assertIn(b'id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden', response.data)
+        self.assertIn(b'id="switch-camera" type="button" hidden', response.data)
+        self.assertNotIn(b'<header', response.data)
+        self.assertNotIn(b'<footer', response.data)
 
     def test_checkin_card_hides_status_history_and_requires_one_selection(self):
         self.login()
@@ -278,10 +372,12 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertIn(b'id="attendee-name"', response.data)
         self.assertIn(b'id="attendee-id"', response.data)
         self.assertIn(b'id="attendance-modal"', response.data)
-        self.assertIn(b'id="mark-present" type="checkbox"', response.data)
-        self.assertIn(b'Mark attendance as Present', response.data)
         self.assertIn(b'Submit Attendance', response.data)
-        self.assertEqual(response.data.count(b'type="radio" name="checkpoint"'), 4)
+        self.assertEqual(response.data.count(b'type="checkbox" name="attendance-checkpoint"'), 4)
+        rendered = response.data.decode("utf-8")
+        for checkpoint in ("Day 1 \u2014 Morning", "Day 1 \u2014 Evening",
+                           "Day 2 \u2014 Morning", "Day 2 \u2014 Evening"):
+            self.assertIn(checkpoint, rendered)
         self.assertNotIn(b'<select', response.data)
 
     @patch("app.requests.post")
@@ -345,8 +441,11 @@ class AttendanceAppTests(unittest.TestCase):
         self.login()
         response = self.post_json("/api/qr-email/candidates", {})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([item["row_number"] for item in response.json["candidates"]], [2, 3, 4])
-        self.assertNotIn("email", response.json["candidates"][0])
+        self.assertEqual([item["registration_id"] for item in response.json["candidates"]],
+                         ["TEST-1", "TEST-2", "TEST-3"])
+        self.assertEqual(response.json["candidates"][0]["email"], "***@example.test")
+        self.assertNotIn("attendee1", response.get_data(as_text=True))
+        self.assertNotIn("row_number", response.json["candidates"][0])
         self.assertNotIn("qr_token", response.json["candidates"][0])
 
     def test_qr_email_test_mode_must_be_enabled(self):
@@ -356,38 +455,132 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json["code"], "email_test_disabled")
 
-    def test_qr_email_send_requires_confirmation_and_rejects_rows_after_first_three(self):
+    def test_qr_email_test_mode_requires_an_approved_recipient_allowlist(self):
         self.login()
-        response = self.post_json("/api/qr-email/send", {"row_number": 2})
+        self.app.config["QR_EMAIL_TEST_RECIPIENTS"] = set()
+        candidates = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(candidates.json["candidates"], [])
+        batch = self.post_json("/api/qr-email/batch", {"action": "all", "confirm_send": True})
+        self.assertEqual(batch.json["sent_count"], 0)
+        self.assertEqual(getattr(self.sheets, "email_sends", []), [])
+
+    def test_qr_email_send_requires_confirmation_and_registration_ids(self):
+        self.login()
+        response = self.post_json("/api/qr-email/send", {"registration_id": "TEST-1"})
         self.assertEqual(response.status_code, 400)
-        response = self.post_json("/api/qr-email/send", {
-            "row_number": 5, "confirm_send": True,
-        })
-        self.assertEqual(response.status_code, 404)
+        response = self.post_json("/api/qr-email/send", {"row_number": 5, "confirm_send": True})
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(getattr(self.sheets, "email_sends", []), [])
 
     @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
     def test_qr_email_delivery_uses_existing_token_and_duplicate_is_blocked(self, make_qr):
         self.login()
         first = self.post_json("/api/qr-email/send", {
-            "row_number": 2, "confirm_send": True,
+            "registration_id": "TEST-1", "confirm_send": True,
         })
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(first.json["email_status"], "Sent")
+        self.assertEqual(first.json["sent_count"], 1)
         self.assertEqual(len(self.sheets.email_sends), 1)
         sent = self.sheets.email_sends[0]
         self.assertEqual(sent["qr_token"], self.sheets.email_rows[0]["qr_token"])
         self.assertEqual(sent["qr_png_base64"], "iVBOR-test-generated-image")
         make_qr.assert_called_once_with(self.sheets.email_rows[0]["qr_token"])
         self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
+        self.assertTrue(self.sheets.email_rows[0]["email_timestamp"])
         self.assertNotIn("email", first.json)
         self.assertNotIn("qr_token", first.json)
 
         second = self.post_json("/api/qr-email/send", {
-            "row_number": 2, "confirm_send": True,
+            "registration_id": "TEST-1", "confirm_send": True,
         })
-        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json["skipped_count"], 1)
         self.assertEqual(len(self.sheets.email_sends), 1)
+
+    @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
+    def test_qr_email_send_all_skips_sent_and_retries_failed_only_by_request(self, _make_qr):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_MODE"] = False
+        self.app.config["QR_EMAIL_BULK_ENABLED"] = True
+        rows = self.sheets._qr_email_rows()
+        rows[0]["email_status"] = "Sent"
+        rows[2]["email_status"] = "Failed"
+        response = self.post_json("/api/qr-email/batch", {"action": "all", "confirm_send": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["sent_count"], 2)
+        self.assertEqual(response.json["remaining_count"], 1)
+        self.assertEqual([item["registration_id"] for item in self.sheets.email_sends],
+                         ["TEST-2", "TEST-3"])
+        self.assertEqual(self.sheets.attendees[self.token]["day1_morning"], "Registered")
+        self.assertEqual(rows[0]["email_status"], "Sent")
+
+        next_batch = self.post_json("/api/qr-email/batch", {
+            "action": "selected", "registration_ids": ["TEST-4"], "confirm_send": True,
+        })
+        self.assertEqual(next_batch.json["sent_count"], 1)
+        self.assertEqual(self.sheets.email_sends[-1]["registration_id"], "TEST-4")
+
+        rows[1]["email_status"] = "Failed"
+        response = self.post_json("/api/qr-email/batch", {
+            "action": "retry_failed", "confirm_send": True,
+        })
+        self.assertEqual(response.json["sent_count"], 1)
+        self.assertEqual(self.sheets.email_sends[-1]["registration_id"], "TEST-2")
+
+    @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
+    def test_qr_email_selected_uses_only_server_resolved_registration_ids(self, _make_qr):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_MODE"] = False
+        self.app.config["QR_EMAIL_BULK_ENABLED"] = True
+        response = self.post_json("/api/qr-email/batch", {
+            "action": "selected", "registration_ids": ["TEST-2"], "confirm_send": True,
+            "email": "attacker@example.test", "qr_token": "forged",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["registration_id"] for item in self.sheets.email_sends], ["TEST-2"])
+        invalid = self.post_json("/api/qr-email/batch", {
+            "action": "selected", "registration_ids": ["UNKNOWN"], "confirm_send": True,
+        })
+        self.assertEqual(invalid.status_code, 400)
+
+    @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
+    def test_qr_email_partial_failure_and_test_mode_three_recipient_cap(self, _make_qr):
+        self.login()
+        self.sheets.fail_email_ids = {"TEST-2"}
+        response = self.post_json("/api/qr-email/batch", {"action": "all", "confirm_send": True})
+        self.assertEqual(response.json["selected_count"], 3)
+        self.assertEqual(response.json["sent_count"], 2)
+        self.assertEqual(response.json["failed_count"], 1)
+        self.assertEqual(self.sheets.email_rows[3]["email_status"], "")
+        self.assertEqual(self.sheets.email_rows[1]["email_error"], "delivery_failed")
+
+    def test_apps_script_email_code_rechecks_registration_and_serializes_duplicate_sends(self):
+        source = Path("apps_script/Code.gs").read_text(encoding="utf-8")
+        self.assertIn("if (!lock.tryLock(0)) return json({ error: true, code: 'email_in_progress' })", source)
+        self.assertIn("item.registrationId === registrationId", source)
+        self.assertIn("candidate.token !== token", source)
+        self.assertIn("oldStatus === 'Sending'", source)
+        self.assertIn("oldStatus === 'Sent'", source)
+        self.assertIn("attachments: [blob]", source)
+
+    @patch("app.qr_png_base64", return_value="iVBOR-test-generated-image")
+    def test_qr_email_invalid_addresses_are_reported_skipped_without_send(self, _make_qr):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_MODE"] = False
+        self.app.config["QR_EMAIL_BULK_ENABLED"] = True
+        self.sheets.email_rows = self.sheets._qr_email_rows()
+        self.sheets.email_rows[1]["email_valid"] = False
+        candidates = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(candidates.status_code, 200)
+        self.assertFalse(candidates.json["candidates"][1]["email_valid"])
+        self.assertEqual(candidates.json["candidates"][1]["email"], "Invalid or missing")
+        response = self.post_json("/api/qr-email/batch", {"action": "all", "confirm_send": True})
+        self.assertEqual(response.json["skipped_count"], 1)
+        self.assertNotIn("TEST-2", [sent["registration_id"] for sent in self.sheets.email_sends])
+
+    def test_qr_email_candidate_and_batch_routes_require_authentication_and_csrf(self):
+        self.assertEqual(self.client.post("/api/qr-email/batch", json={"action": "all"}).status_code, 401)
+        self.login()
+        self.assertEqual(self.client.post("/api/qr-email/batch", json={"action": "all"}).status_code, 403)
 
     @patch("app.requests.post")
     def test_apps_script_qr_email_client_uses_mocked_http_actions(self, mocked_post):
@@ -399,9 +592,11 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_args.kwargs["json"]["action"], "qr_email_candidates")
 
         response.json.return_value = {"sent": True, "email_status": "Sent"}
-        result = client.send_qr_email(2, self.token, "test-image-data")
+        result = client.send_qr_email("REG-1", self.token, "test-image-data", retry_failed=True)
         self.assertTrue(result["sent"])
         self.assertEqual(mocked_post.call_args.kwargs["json"]["action"], "send_qr_email")
+        self.assertEqual(mocked_post.call_args.kwargs["json"]["registration_id"], "REG-1")
+        self.assertTrue(mocked_post.call_args.kwargs["json"]["retry_failed"])
 
 
 if __name__ == "__main__":
