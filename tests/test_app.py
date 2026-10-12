@@ -168,6 +168,7 @@ class AttendanceAppTests(unittest.TestCase):
         self.login()
         lookup = self.post_json("/api/lookup", {"token": self.token})
         self.assertEqual(lookup.status_code, 200)
+        self.assertEqual(lookup.json["already_present_checkpoints"], [])
         self.assertEqual({key: lookup.json["attendee"][key] for key in (
             "day1_morning", "day1_evening", "day2_morning", "day2_evening"
         )}, {key: "Registered" for key in (
@@ -262,6 +263,7 @@ class AttendanceAppTests(unittest.TestCase):
         self.sheets.attendees[self.token]["day1_morning"] = "Present"
         lookup = self.post_json("/api/lookup", {"token": self.token})
         self.assertEqual(lookup.json["attendee"]["day1_morning"], "Present")
+        self.assertEqual(lookup.json["already_present_checkpoints"], ["day1_morning"])
         self.assertEqual(lookup.json["attendee"]["day2_evening"], "Registered")
         duplicate = self.post_json("/api/attendance", {
             "token": self.token, "checkpoint": "day1_morning", "status": "Present",
@@ -352,21 +354,44 @@ class AttendanceAppTests(unittest.TestCase):
             "expected_status": "Registered",
         })
 
-    def test_checkin_initial_screen_is_scanner_only_and_switch_is_hidden(self):
+    def test_dashboard_shows_after_login_and_scanner_is_a_hidden_modal(self):
         self.login()
-        response = self.client.get("/")
+        self.assertEqual(self.client.get("/").status_code, 303)
+        response = self.client.get("/dashboard")
         self.assertEqual(response.status_code, 200)
+        self.assertIn(b'Startup Conclave', response.data)
+        self.assertIn(b'id="open-scanner"', response.data)
+        self.assertIn(b'id="scanner-modal"', response.data)
+        self.assertIn(b'id="scanner-modal" class="scanner-modal" role="dialog" aria-modal="true" aria-labelledby="scanner-title" hidden', response.data)
+        self.assertIn(b'Attendee QR Codes', response.data)
+        self.assertIn(b'QR Email Management', response.data)
         self.assertIn(b'id="reader"', response.data)
         self.assertIn(b'id="start-scan"', response.data)
         self.assertIn(b'id="stop-scan"', response.data)
         self.assertIn(b'id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden', response.data)
         self.assertIn(b'id="switch-camera" type="button" hidden', response.data)
-        self.assertNotIn(b'<header', response.data)
-        self.assertNotIn(b'<footer', response.data)
+        self.assertIn(b'<header', response.data)
+        self.assertIn(b'<footer', response.data)
+        self.assertEqual(response.data.count(b'type="checkbox" name="scanner-checkpoint"'), 4)
+
+    def test_dashboard_authentication_logout_and_no_signup(self):
+        self.assertIn(b'Coordinator password', self.client.get("/").data)
+        self.assertEqual(self.client.get("/dashboard").status_code, 303)
+        self.assertEqual(self.client.get("/qrcodes").status_code, 303)
+        self.assertEqual(self.client.get("/qr-email-test").status_code, 303)
+        self.assertEqual(self.client.get("/signup").status_code, 404)
+        login_response = self.client.post("/login", data={"password": "coordinator-pass"})
+        self.assertEqual(login_response.headers["Location"], "/dashboard")
+        with self.client.session_transaction() as state:
+            token = state["csrf_token"]
+        logout = self.client.post("/logout", data={"_csrf": token})
+        self.assertEqual(logout.status_code, 303)
+        self.assertEqual(logout.headers["Location"], "/")
+        self.assertEqual(self.client.get("/dashboard").status_code, 303)
 
     def test_checkin_card_hides_status_history_and_requires_one_selection(self):
         self.login()
-        response = self.client.get("/")
+        response = self.client.get("/dashboard")
         self.assertNotIn(b"Existing status at all checkpoints", response.data)
         self.assertNotIn(b"Selected checkpoint status", response.data)
         self.assertIn(b'id="attendee-name"', response.data)
@@ -445,8 +470,39 @@ class AttendanceAppTests(unittest.TestCase):
                          ["TEST-1", "TEST-2", "TEST-3"])
         self.assertEqual(response.json["candidates"][0]["email"], "***@example.test")
         self.assertNotIn("attendee1", response.get_data(as_text=True))
+
+    def test_ambiguous_email_outcome_is_exposed_as_manual_review_not_retryable(self):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_RECIPIENTS"] = {"attendee1@example.test"}
+        row = self.sheets._qr_email_rows()[0]
+        row["email_status"] = "Sending"
+        row["email_error"] = "outcome_unknown"
+        response = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(response.status_code, 200)
+        candidate = response.json["candidates"][0]
+        self.assertEqual(candidate["email_status"], "Manual review")
+        self.assertEqual(candidate["email_error"], "outcome_unknown")
         self.assertNotIn("row_number", response.json["candidates"][0])
         self.assertNotIn("qr_token", response.json["candidates"][0])
+        batch = self.post_json("/api/qr-email/batch", {"action": "all", "confirm_send": True})
+        self.assertEqual(batch.json["manual_review_count"], 1)
+        self.assertEqual(batch.json["sent_count"], 0)
+        self.assertEqual(getattr(self.sheets, "email_sends", []), [])
+
+    def test_retry_exhausted_email_is_manual_review_and_not_retried(self):
+        self.login()
+        self.app.config["QR_EMAIL_TEST_RECIPIENTS"] = {"attendee1@example.test"}
+        row = self.sheets._qr_email_rows()[0]
+        row["email_status"] = "Failed"
+        row["email_error"] = "retry_exhausted"
+        response = self.post_json("/api/qr-email/candidates", {})
+        self.assertEqual(response.json["candidates"][0]["email_status"], "Manual review")
+        batch = self.post_json("/api/qr-email/batch", {
+            "action": "retry_failed", "confirm_send": True,
+        })
+        self.assertEqual(batch.json["manual_review_count"], 1)
+        self.assertEqual(batch.json["sent_count"], 0)
+        self.assertEqual(getattr(self.sheets, "email_sends", []), [])
 
     def test_qr_email_test_mode_must_be_enabled(self):
         self.login()
@@ -597,6 +653,15 @@ class AttendanceAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_args.kwargs["json"]["action"], "send_qr_email")
         self.assertEqual(mocked_post.call_args.kwargs["json"]["registration_id"], "REG-1")
         self.assertTrue(mocked_post.call_args.kwargs["json"]["retry_failed"])
+
+    def test_apps_script_sender_uses_only_configured_authorized_alias_and_reusable_template(self):
+        source = Path("apps_script/Code.gs").read_text(encoding="utf-8")
+        self.assertIn("GmailApp.getAliases()", source)
+        self.assertIn("mailOptions.from = sender.senderEmail", source)
+        self.assertIn("MailApp.sendEmail(Object.assign", source)
+        self.assertIn("sender_not_authorized", source)
+        self.assertIn("candidate.registrationId", source)
+        self.assertIn("attachments: [blob]", source)
 
 
 if __name__ == "__main__":

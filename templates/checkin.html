@@ -5,31 +5,77 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#102b35">
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <title>QRTS Attendance Scanner</title>
+  <title>QRTS Dashboard · Startup Conclave 2026</title>
   <link rel="stylesheet" href="/static/app.css">
   <script defer src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <script defer src="/static/app.js"></script>
 </head>
-<body class="scanner-page">
-  <main class="scanner-shell">
-    <div id="reader" class="reader" aria-label="QR camera preview"></div>
-    <div class="camera-switch-row"><button class="secondary" id="switch-camera" type="button" hidden>Change Camera</button></div>
-    <div class="scanner-controls">
-      <button class="primary" id="start-scan" type="button">Start Scanner</button>
-      <button class="secondary" id="stop-scan" type="button" disabled>Stop Scanner</button>
-    </div>
-    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+<body class="dashboard-page">
+  <header class="dashboard-header">
+    <a class="brand" href="/dashboard" aria-label="QRTS Dashboard home"><span class="brand-mark">Q</span><span><strong>QRTS</strong><small>COORDINATOR DESK</small></span></a>
+    <nav class="dashboard-nav" aria-label="Coordinator navigation">
+      <a class="nav-current" href="/dashboard">Dashboard</a>
+      <a href="/qrcodes">Attendee QR Codes</a>
+      {% if qr_email_test_mode or qr_email_bulk_enabled %}<a href="/qr-email-test">QR Email Management</a>{% else %}<span class="nav-disabled" aria-disabled="true" title="Enable email mode in server configuration">QR Email Management · Off</span>{% endif %}
+      <form action="/logout" method="post"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button class="nav-logout" type="submit">Logout</button></form>
+    </nav>
+  </header>
+
+  <main id="dashboard-main" class="dashboard-main">
+    <section class="dashboard-hero">
+      <div><span class="eyebrow">COORDINATOR HOME</span><h1>Startup Conclave <span>2026</span></h1><p>AKGEC · Ghaziabad <span class="hero-divider">/</span> Attendance operations</p></div>
+      <div class="event-badge"><span class="event-live-dot"></span> Event check-in desk</div>
+    </section>
+
+    <section class="dashboard-section">
+      <div class="dashboard-section-heading"><div><span class="eyebrow">EVENT TOOLS</span><h2>What would you like to do?</h2></div></div>
+      <div class="dashboard-cards">
+        <article class="dashboard-card scanner-action-card">
+          <div class="card-icon scanner-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3M7 12h10M12 7v10"/></svg></div>
+          <span class="tool-kicker">FAST CHECK-IN</span><h3>Attendance Desk</h3><p>Verify attendee QR codes and mark one or more event checkpoints.</p>
+          <button id="open-scanner" class="primary" type="button">Start Scanning <span aria-hidden="true">→</span></button>
+        </article>
+        <a class="dashboard-card tool-card-link" href="/qrcodes">
+          <div class="card-icon qr-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h3v3h-3zM19 14v2M17 20h3M20 18v2"/></svg></div>
+          <span class="tool-kicker">ATTENDEE ACCESS</span><h3>Attendee QR Codes</h3><p>Load registered attendees, view or download their stable QR codes, and prepare a printout.</p><span class="card-link-text">Open QR management <span aria-hidden="true">→</span></span>
+        </a>
+        {% if qr_email_test_mode or qr_email_bulk_enabled %}<a class="dashboard-card tool-card-link" href="/qr-email-test">{% else %}<article class="dashboard-card disabled-tool" aria-disabled="true">{% endif %}
+          <div class="card-icon email-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 6h18v12H3zM3 7l9 7 9-7"/></svg></div>
+          <span class="tool-kicker">PERSONALIZED DELIVERY</span><h3>QR Email Management</h3><p>{% if qr_email_test_mode %}Review per-attendee status and send only to the approved test cohort.{% elif qr_email_bulk_enabled %}Review per-attendee email status and run an explicitly confirmed batch.{% else %}Email sending is disabled in server configuration. No message can be sent.{% endif %}</p><span class="card-link-text">{% if qr_email_test_mode or qr_email_bulk_enabled %}Open email management <span aria-hidden="true">→</span>{% else %}Currently disabled{% endif %}</span>
+        {% if qr_email_test_mode or qr_email_bulk_enabled %}</a>{% else %}</article>{% endif %}
+      </div>
+    </section>
+    <footer class="dashboard-footer"><span>QRTS · Startup Conclave 2026</span><span>Coordinator access only</span></footer>
   </main>
+
+  <section id="scanner-modal" class="scanner-modal" role="dialog" aria-modal="true" aria-labelledby="scanner-title" hidden>
+    <button class="scanner-backdrop" id="close-scanner-backdrop" type="button" aria-label="Close scanner"></button>
+    <div class="scanner-dialog">
+      <header class="scanner-dialog-header"><div><span class="eyebrow">ATTENDANCE DESK</span><h2 id="scanner-title">Scan attendee QR</h2></div><button id="close-scanner" class="icon-close" type="button" aria-label="Close scanner">×</button></header>
+      <p class="scanner-dialog-subtitle">Select event checkpoints, then scan the attendee's QR code.</p>
+      <fieldset class="scan-checkpoints">
+        <legend>Checkpoints for this scan <span>(optional preselection)</span></legend>
+        <label><input type="checkbox" name="scanner-checkpoint" value="day1_morning"><span>Day 1 <b>Morning</b></span></label>
+        <label><input type="checkbox" name="scanner-checkpoint" value="day1_evening"><span>Day 1 <b>Evening</b></span></label>
+        <label><input type="checkbox" name="scanner-checkpoint" value="day2_morning"><span>Day 2 <b>Morning</b></span></label>
+        <label><input type="checkbox" name="scanner-checkpoint" value="day2_evening"><span>Day 2 <b>Evening</b></span></label>
+      </fieldset>
+      <div id="reader" class="reader scanner-reader" aria-label="QR camera preview"><div class="scanner-placeholder"><span class="placeholder-camera" aria-hidden="true">⌗</span><span>Camera preview will appear here</span></div></div>
+      <div class="camera-switch-row"><button class="secondary" id="switch-camera" type="button" hidden>Change Camera</button></div>
+      <div class="scanner-controls"><button class="primary" id="start-scan" type="button">Start Scanner</button><button class="secondary" id="stop-scan" type="button" disabled>Stop Scanner</button></div>
+      <div id="notice" class="notice scanner-notice" role="status" aria-live="polite" hidden></div>
+    </div>
+  </section>
 
   <section id="attendance-modal" class="attendance-modal" role="dialog" aria-modal="true" aria-labelledby="attendee-name" aria-describedby="attendee-id" hidden>
     <div class="modal-backdrop"></div>
     <div class="modal-card">
       <button id="cancel-scan" class="modal-close secondary" type="button">Cancel</button>
-      <span class="eyebrow">ATTENDEE VERIFIED</span>
-      <h1 id="attendee-name"></h1>
+      <span class="eyebrow">ATTENDEE VERIFIED</span><h1 id="attendee-name"></h1>
       <p class="registration-line">Registration ID <strong id="attendee-id"></strong></p>
+      <div id="duplicate-alert" class="duplicate-alert" role="alert" hidden><div><strong>Already marked Present</strong><p id="duplicate-details"></p></div><button id="dismiss-duplicate" type="button" aria-label="Dismiss duplicate attendance alert">×</button></div>
       <fieldset class="modal-checkpoints">
-        <legend>Select checkpoint(s)</legend>
+        <legend>Select checkpoint(s) to mark Present</legend>
         <label><input type="checkbox" name="attendance-checkpoint" value="day1_morning"><span>Day 1 — Morning</span></label>
         <label><input type="checkbox" name="attendance-checkpoint" value="day1_evening"><span>Day 1 — Evening</span></label>
         <label><input type="checkbox" name="attendance-checkpoint" value="day2_morning"><span>Day 2 — Morning</span></label>

@@ -210,6 +210,25 @@ function escapeHtml_(value) {
   }[ch]));
 }
 
+function emailSenderConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const senderName = String(props.getProperty('SENDER_NAME') || 'Startup Conclave 2026').trim();
+  const senderEmail = String(props.getProperty('SENDER_EMAIL') || '').trim();
+  const replyTo = String(props.getProperty('REPLY_TO_EMAIL') || '').trim();
+  if (!senderName || senderName.length > 80 || /[\r\n]/.test(senderName) ||
+      (replyTo && !EMAIL_RE.test(replyTo))) return { error: 'email_sender_not_authorized' };
+  if (senderEmail) {
+    if (!EMAIL_RE.test(senderEmail)) return { error: 'email_sender_not_authorized' };
+    try {
+      const aliases = GmailApp.getAliases().map(value => String(value).toLowerCase());
+      if (!aliases.includes(senderEmail.toLowerCase())) return { error: 'email_sender_not_authorized' };
+    } catch (err) {
+      return { error: 'email_sender_not_authorized' };
+    }
+  }
+  return { senderName, senderEmail, replyTo };
+}
+
 function sendQrEmail_(body) {
   const registrationId = typeof body.registration_id === 'string' ? body.registration_id.trim() : '';
   const token = body.token;
@@ -249,6 +268,7 @@ function sendQrEmail_(body) {
     const timestampCell = cfg.sheet.getRange(rowNumber, tracking.timestamp);
     const errorCell = cfg.sheet.getRange(rowNumber, tracking.error);
     let oldStatus = String(statusCell.getDisplayValue() || '').trim();
+    const oldError = String(errorCell.getDisplayValue() || '').trim();
     if (oldStatus === 'Pending') oldStatus = '';
     const retryFailed = body.retry_failed === true;
     if (oldStatus === 'Sent') return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
@@ -256,6 +276,18 @@ function sendQrEmail_(body) {
     if (oldStatus === 'Failed' && !retryFailed) return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
     if (oldStatus && oldStatus !== 'Failed') return json({ error: true, code: 'email_already_attempted', email_status: oldStatus });
     if (retryFailed && oldStatus !== 'Failed') return json({ error: true, code: 'email_retry_not_allowed', email_status: oldStatus });
+    if (retryFailed && oldError === 'retry_exhausted') {
+      return json({ error: true, code: 'email_retry_not_allowed', email_status: oldStatus });
+    }
+
+    const sender = emailSenderConfig_();
+    if (sender.error) {
+      statusCell.setValue('Failed');
+      timestampCell.setValue(new Date());
+      errorCell.setValue('sender_not_authorized');
+      SpreadsheetApp.flush();
+      return json({ error: true, code: sender.error, email_status: 'Failed' });
+    }
 
     const attemptedAt = new Date();
     statusCell.setValue('Sending');
@@ -273,22 +305,36 @@ function sendQrEmail_(body) {
     try {
       const blob = Utilities.newBlob(imageBytes, 'image/png', 'attendee-qr.png');
       const safeName = escapeHtml_(candidate.name);
-      MailApp.sendEmail({
-        to: candidate.email,
-        subject: 'Your QR code for Startup Conclave 2026',
-        body: 'Hello ' + candidate.name + ', Registration ID: ' + candidate.registrationId +
-          '. Your individual QR code is attached. Please keep it available for event check-in.',
-        htmlBody: '<p>Hello ' + safeName + ',</p><p>Registration ID: <strong>' + escapeHtml_(candidate.registrationId) +
-          '</strong></p><p>Your individual attendee QR code is below. Please keep it available for event check-in.</p><p><img src="cid:attendeeQr" alt="Your attendee QR code"></p>',
+      const subject = 'Your QR code for Startup Conclave 2026';
+      const body = 'Hello ' + candidate.name + ',\n\n' + sender.senderName +
+        ' · 15–16 October 2026 · AKGEC, Ghaziabad\nRegistration ID: ' + candidate.registrationId +
+        '\n\nYour individual attendee QR code is attached. Please keep it available for event entry and check-in.' +
+        (sender.replyTo ? '\n\nFor help, reply to this email.' : '');
+      const mailOptions = {
+        name: sender.senderName,
+        htmlBody: '<p>Hello ' + safeName + ',</p><p><strong>' + escapeHtml_(sender.senderName) +
+          '</strong> · 15–16 October 2026 · AKGEC, Ghaziabad</p><p>Registration ID: <strong>' + escapeHtml_(candidate.registrationId) +
+          '</strong></p><p>Your individual attendee QR code is below. Please keep it available for event entry and check-in.</p>' +
+          (sender.replyTo ? '<p>For help, reply to this email.</p>' : '') +
+          '<p><img src="cid:attendeeQr" alt="Your attendee QR code"></p>',
         inlineImages: { attendeeQr: blob },
         attachments: [blob]
-      });
+      };
+      if (sender.replyTo) mailOptions.replyTo = sender.replyTo;
+      if (sender.senderEmail) {
+        mailOptions.from = sender.senderEmail;
+        GmailApp.sendEmail(candidate.email, subject, body, mailOptions);
+      } else {
+        MailApp.sendEmail(Object.assign({ to: candidate.email, subject, body }, mailOptions));
+      }
       mailAccepted = true;
     } catch (err) {
-      statusCell.setValue('Failed');
-      errorCell.setValue('delivery_failed');
+      // A send exception can be ambiguous: keep the row locked from retries until
+      // an operator checks whether the provider accepted the message.
+      statusCell.setValue('Sending');
+      errorCell.setValue('outcome_unknown');
       SpreadsheetApp.flush();
-      return json({ error: true, code: 'email_delivery_failed', email_status: 'Failed' });
+      return json({ error: true, code: 'email_ambiguous_outcome', email_status: 'Sending' });
     }
     if (mailAccepted) {
       try {

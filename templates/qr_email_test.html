@@ -9,7 +9,7 @@
   <script defer src="/static/qr_email_test.js"></script>
 </head>
 <body>
-  <header class="topbar"><strong>QRTS · QR Email Management</strong><a class="quiet-link" href="/">Back to attendance</a></header>
+  <header class="topbar"><strong>QRTS · QR Email Management</strong><nav class="top-actions"><a class="quiet-link" href="/dashboard">Dashboard</a><a class="quiet-link" href="/qrcodes">Attendee QR Codes</a><form action="/logout" method="post"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button class="quiet-link" type="submit">Logout</button></form></nav></header>
   <main class="layout qr-email-management" data-test-mode="{{ 'true' if test_mode else 'false' }}">
     <section class="intro"><span class="eyebrow">COORDINATOR TOOL</span><h1>QR Email Management</h1>
       <p>Each attendee receives a separate message with the QR image generated from their existing token. The provider accepting a message does not confirm inbox delivery.</p></section>

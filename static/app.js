@@ -4,10 +4,14 @@
   const stop = document.querySelector('#stop-scan');
   const switchCamera = document.querySelector('#switch-camera');
   const reader = document.querySelector('#reader');
-  const mainContent = document.querySelector('main');
+  const mainContent = document.querySelector('#dashboard-main');
+  const scannerModal = document.querySelector('#scanner-modal');
+  const scanCheckpointOptions = Array.from(document.querySelectorAll('input[name="scanner-checkpoint"]'));
   const notice = document.querySelector('#notice');
   const modal = document.querySelector('#attendance-modal');
   const checkpointOptions = Array.from(document.querySelectorAll('input[name="attendance-checkpoint"]'));
+  const duplicateAlert = document.querySelector('#duplicate-alert');
+  const duplicateDetails = document.querySelector('#duplicate-details');
   const modalFeedback = document.querySelector('#modal-feedback');
   const submitAttendance = document.querySelector('#confirm-update');
   const toast = document.querySelector('#toast');
@@ -63,7 +67,7 @@
   function updateCameraControls() {
     start.disabled = cameraBusy || active;
     stop.disabled = cameraBusy || !active;
-    switchCamera.hidden = cameraBusy || !active || !previewReady;
+    switchCamera.hidden = cameraBusy || !active || !previewReady || scannerModal.hidden || !modal.hidden;
     switchCamera.disabled = cameraBusy || !previewReady;
     switchCamera.textContent = 'Change Camera';
   }
@@ -184,14 +188,44 @@
   function resetAttendanceForm() {
     current = null;
     modal.hidden = true;
-    mainContent.inert = false;
+    mainContent.inert = !scannerModal.hidden;
     checkpointOptions.forEach((option) => { option.checked = false; });
+    scanCheckpointOptions.forEach((option) => { option.checked = false; });
+    duplicateAlert.hidden = true;
+    duplicateDetails.textContent = '';
     document.querySelector('#attendee-name').textContent = '';
     document.querySelector('#attendee-id').textContent = '';
     modalFeedback.hidden = true;
     modalFeedback.textContent = '';
     submitAttendance.disabled = false;
     submitAttendance.textContent = 'Submit Attendance';
+  }
+
+  function refreshDuplicateAlert() {
+    if (!current) return;
+    const selected = selectedCheckpointKeys();
+    const relevant = selected.length ? selected : current.alreadyPresent;
+    const existing = current.alreadyPresent.filter((key) => relevant.includes(key));
+    if (!existing.length) {
+      duplicateAlert.hidden = true;
+      duplicateDetails.textContent = '';
+      return;
+    }
+    duplicateDetails.textContent = `${current.attendee.name} · Registration ID ${current.attendee.registration_id} is already Present at ${existing.map((key) => checkpointLabels[key]).join(', ')}. Other checkpoints can still be marked.`;
+    duplicateAlert.hidden = false;
+  }
+
+  async function closeScannerModal() {
+    if (cameraBusy || updateInProgress) return;
+    cameraBusy = true;
+    updateCameraControls();
+    await stopScanner();
+    resetAttendanceForm();
+    scannerModal.hidden = true;
+    mainContent.inert = false;
+    notice.hidden = true;
+    cameraBusy = false;
+    updateCameraControls();
   }
 
   async function handleScan(decoded) {
@@ -202,14 +236,21 @@
     message('Verifying QR code…');
     try {
       const result = await api('/api/lookup', {token: decoded});
-      current = {token: decoded, attendee: result.attendee};
+      current = {token: decoded, attendee: result.attendee,
+        alreadyPresent: Array.isArray(result.already_present_checkpoints)
+          ? result.already_present_checkpoints.filter((key) => checkpointLabels[key])
+          : Object.keys(checkpointLabels).filter((key) => result.attendee[key] === 'Present')};
       document.querySelector('#attendee-name').textContent = result.attendee.name;
       document.querySelector('#attendee-id').textContent = result.attendee.registration_id;
-      checkpointOptions.forEach((option) => { option.checked = false; });
+      checkpointOptions.forEach((option) => {
+        const preselected = scanCheckpointOptions.find((scanOption) => scanOption.value === option.value);
+        option.checked = Boolean(preselected && preselected.checked);
+      });
       modalFeedback.hidden = true;
       modalFeedback.textContent = '';
       mainContent.inert = true;
       modal.hidden = false;
+      refreshDuplicateAlert();
       document.querySelector('#cancel-scan').focus();
     } catch (error) {
       resetAttendanceForm();
@@ -228,6 +269,16 @@
     notice.hidden = true;
     await startCamera(activeFacing);
   });
+  document.querySelector('#open-scanner').addEventListener('click', () => {
+    resetAttendanceForm();
+    notice.hidden = true;
+    scannerModal.hidden = false;
+    mainContent.inert = true;
+    updateCameraControls();
+    start.focus();
+  });
+  document.querySelector('#close-scanner').addEventListener('click', closeScannerModal);
+  document.querySelector('#close-scanner-backdrop').addEventListener('click', closeScannerModal);
   switchCamera.addEventListener('click', async () => {
     if (cameraBusy || !previewReady || !active) return;
     await startCamera(activeFacing === 'user' ? 'environment' : 'user');
@@ -246,9 +297,15 @@
     resetAttendanceForm();
     message('Attendance cancelled. Start Scanner when ready.');
   });
+  checkpointOptions.forEach((option) => option.addEventListener('change', refreshDuplicateAlert));
+  document.querySelector('#dismiss-duplicate').addEventListener('click', () => {
+    duplicateAlert.hidden = true;
+  });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !modal.hidden && !updateInProgress) {
       document.querySelector('#cancel-scan').click();
+    } else if (event.key === 'Escape' && !scannerModal.hidden && !cameraBusy) {
+      closeScannerModal();
     }
   });
   submitAttendance.addEventListener('click', async () => {
@@ -271,14 +328,36 @@
     modalFeedback.hidden = true;
     try {
       const result = await api('/api/attendance', {token: attendee.token, checkpoints});
-      const completed = [...(result.updated_checkpoints || []), ...(result.already_present || [])];
+      const updated = result.updated_checkpoints || [];
+      const alreadyPresent = result.already_present || [];
+      const completed = [...updated, ...alreadyPresent];
       if (result.success !== true || completed.length !== selected.length) {
         throw Object.assign(new Error('Attendance update was not confirmed. Please retry.'), {
           result: {updated_checkpoints: result.updated_checkpoints || [],
             already_present: result.already_present || [], code: 'incomplete_result'},
         });
       }
-      const count = completed.length;
+      if (alreadyPresent.length) {
+        updated.forEach((key) => { attendee.attendee[key] = 'Present'; });
+        alreadyPresent.forEach((key) => { attendee.attendee[key] = 'Present'; });
+        attendee.alreadyPresent = [...new Set([...attendee.alreadyPresent, ...alreadyPresent])];
+        checkpointOptions.forEach((option) => {
+          if (completed.includes(option.value)) option.checked = false;
+        });
+        refreshDuplicateAlert();
+        const duplicateText = alreadyPresent.map((key) => checkpointLabels[key] || 'selected checkpoint').join(', ');
+        modalFeedback.textContent = updated.length
+          ? `Updated ${updated.length} checkpoint(s). Already Present at: ${duplicateText}. Select another checkpoint or cancel to continue scanning.`
+          : `No new attendance was recorded. ${attendee.attendee.name} (Registration ID ${attendee.attendee.registration_id}) is already Present at: ${duplicateText}.`;
+        modalFeedback.className = 'notice warning';
+        modalFeedback.hidden = false;
+        if (updated.length) showToast(`Attendance marked Present for ${updated.length} checkpoint(s)`, 'success');
+        else showToast('Attendance already recorded. Review checkpoints.', 'error');
+        submitAttendance.disabled = false;
+        submitAttendance.textContent = 'Submit Attendance';
+        return;
+      }
+      const count = updated.length;
       resetAttendanceForm();
       const successText = count === 1 ? 'Marked Present Successfully'
         : `Attendance marked Present for ${count} checkpoints`;

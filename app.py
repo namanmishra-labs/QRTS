@@ -16,9 +16,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 TOKEN_PATTERN = re.compile(r"^QRTS1:[A-Za-z0-9-]{20,80}$")
-ALLOWED_CHECKPOINTS = {
-    "day1_morning", "day1_evening", "day2_morning", "day2_evening"
-}
+CHECKPOINT_ORDER = ("day1_morning", "day1_evening", "day2_morning", "day2_evening")
+ALLOWED_CHECKPOINTS = set(CHECKPOINT_ORDER)
 ALLOWED_STATUSES = {"Registered", "Present"}
 QR_EMAIL_TEST_LIMIT = 3
 QR_EMAIL_BATCH_LIMIT = 3
@@ -32,8 +31,9 @@ QR_EMAIL_ERROR_MESSAGES = {
     "email_invalid_image": "The generated QR image was invalid.",
     "email_confirmation_required": "Confirm one eligible attendee email.",
     "email_invalid_recipient": "This attendee has no valid email address.",
+    "email_sender_not_authorized": "The configured sender is not an authorized account or alias. No email was sent.",
     "email_invalid_selection": "Choose attendees from the current list.",
-    "email_retry_not_allowed": "Only failed email attempts can be retried.",
+    "email_retry_not_allowed": "Only one delivery retry is allowed. Review the email status before taking further action.",
     "email_ambiguous_outcome": "The send outcome needs manual review before retrying.",
     "email_in_progress": "An email operation is already running. Reload the status before retrying.",
     "email_service_unavailable": "The QR email service is unavailable.",
@@ -193,10 +193,19 @@ def run_qr_email_batch(sheets, body, config, error_messages, error_response,
     for candidate in requested:
         reg_id = candidate.get("registration_id", "")
         status = candidate.get("email_status") or "Pending"
+        if ((status == "Sending" and candidate.get("email_error") == "outcome_unknown") or
+                (status == "Failed" and candidate.get("email_error") == "retry_exhausted")):
+            status = "Manual review"
         if reg_id in duplicate_ids or not candidate.get("email_valid"):
             skipped_count += 1
             outcomes.append({"registration_id": reg_id, "status": "Skipped",
                              "reason": "invalid_email" if not candidate.get("email_valid") else "duplicate_registration"})
+            continue
+        if status == "Manual review":
+            manual_review_count += 1
+            outcomes.append({"registration_id": reg_id, "status": "Review",
+                             "reason": "retry_limit_reached" if candidate.get("email_error") == "retry_exhausted"
+                             else "outcome_unknown"})
             continue
         if status == "Sent" or status == "Sending" or status not in {"Pending", "Failed"}:
             skipped_count += 1
@@ -250,7 +259,7 @@ def run_qr_email_batch(sheets, body, config, error_messages, error_response,
             else:
                 failed_count += 1
                 code = send_result.get("code")
-                safe_code = code if code in {"email_quota_exhausted", "email_delivery_failed", "qr_generation_failed"} else "email_delivery_failed"
+                safe_code = code if code in {"email_quota_exhausted", "email_delivery_failed", "email_sender_not_authorized", "qr_generation_failed"} else "email_delivery_failed"
                 outcomes.append({"registration_id": reg_id, "status": "Failed", "reason": safe_code})
         else:
             manual_review_count += 1
@@ -332,9 +341,18 @@ def create_app(test_config=None, sheets_client=None):
         if not login_ready:
             return render_template("setup.html"), 503
         if session.get("coordinator"):
-            return render_template("checkin.html", csrf_token=session["csrf_token"],
-                                   qr_email_test_mode=app.config["QR_EMAIL_TEST_MODE"])
+            return make_response("", 303, {"Location": "/dashboard"})
         return render_template("login.html")
+
+    @app.get("/dashboard")
+    def dashboard():
+        if not login_ready:
+            return render_template("setup.html"), 503
+        if not session.get("coordinator"):
+            return make_response("", 303, {"Location": "/"})
+        return render_template("checkin.html", csrf_token=session["csrf_token"],
+                               qr_email_test_mode=app.config["QR_EMAIL_TEST_MODE"],
+                               qr_email_bulk_enabled=app.config["QR_EMAIL_BULK_ENABLED"])
 
     @app.post("/login")
     def login():
@@ -357,12 +375,12 @@ def create_app(test_config=None, sheets_client=None):
         session.clear()
         session["coordinator"] = True
         session["csrf_token"] = secrets.token_urlsafe(32)
-        return make_response("", 303, {"Location": "/"})
+        return make_response("", 303, {"Location": "/dashboard"})
 
     @app.post("/logout")
     def logout():
         if session.get("coordinator"):
-            supplied = request.headers.get("X-CSRF-Token", "")
+            supplied = request.headers.get("X-CSRF-Token", "") or request.form.get("_csrf", "")
             if not hmac.compare_digest(supplied, session.get("csrf_token", "")):
                 return "Request verification failed.", 403
         session.clear()
@@ -385,7 +403,9 @@ def create_app(test_config=None, sheets_client=None):
     def qrcodes():
         if not session.get("coordinator"):
             return make_response("", 303, {"Location": "/"})
-        return render_template("qrcodes.html", csrf_token=session["csrf_token"])
+        return render_template("qrcodes.html", csrf_token=session["csrf_token"],
+                               qr_email_test_mode=app.config["QR_EMAIL_TEST_MODE"],
+                               qr_email_bulk_enabled=app.config["QR_EMAIL_BULK_ENABLED"])
 
     @app.get("/qr-email-test")
     def qr_email_test_page():
@@ -441,10 +461,14 @@ def create_app(test_config=None, sheets_client=None):
         safe_candidates = []
         for item in candidates:
             status = item.get("email_status") or "Pending"
-            if status not in {"Pending", "Sending", "Sent", "Failed"}:
+            if ((status == "Sending" and item.get("email_error") == "outcome_unknown") or
+                    (status == "Failed" and item.get("email_error") == "retry_exhausted")):
+                status = "Manual review"
+            if status not in {"Pending", "Sending", "Sent", "Failed", "Manual review"}:
                 status = "Unknown"
             error = item.get("email_error", "")
-            if error not in {"", "quota_exhausted", "delivery_failed", "outcome_unknown"}:
+            if error not in {"", "quota_exhausted", "delivery_failed", "outcome_unknown",
+                             "sender_not_authorized", "retry_exhausted"}:
                 error = ""
             timestamp = item.get("email_timestamp", "")
             if not isinstance(timestamp, str) or len(timestamp) > 40:
@@ -495,7 +519,10 @@ def create_app(test_config=None, sheets_client=None):
             return jsonify(error=str(exc), code="sheets_error"), 502
         if result.get("not_found") or not result.get("attendee"):
             return jsonify(error="QR code was not found in this event.", code="unknown_qr"), 404
-        return jsonify(attendee=result["attendee"])
+        attendee = result["attendee"]
+        already_present = [key for key in CHECKPOINT_ORDER
+                           if attendee.get(key) == "Present"]
+        return jsonify(attendee=attendee, already_present_checkpoints=already_present)
 
     @app.post("/api/attendance")
     @authenticated
